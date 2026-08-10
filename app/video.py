@@ -1,6 +1,8 @@
 import os
 import random
 import subprocess
+import tempfile
+
 
 # ============================================================
 # VIDEO SETTINGS
@@ -8,11 +10,32 @@ import subprocess
 
 TARGET_WIDTH = 1280
 TARGET_HEIGHT = 720
+
 FPS = 30
-# Quality: lower = better quality / larger file
+
+# Lower CRF = better quality / larger file
+# 18 = very high quality
+# 20 = excellent balance
 CRF = 20
-# Encoding preset
+
+# Encoding speed
 PRESET = "veryfast"
+
+# Transition settings
+TRANSITION_MIN_CLIPS = 4
+TRANSITION_MAX_CLIPS = 8
+
+TRANSITION_DURATION = 0.35
+
+TRANSITIONS = [
+    "fade",
+    "fadeblack",
+    "wipeleft",
+    "wiperight",
+    "slideleft",
+    "slideright",
+]
+
 
 VIDEO_EXTENSIONS = (
     ".mp4",
@@ -28,10 +51,8 @@ VIDEO_EXTENSIONS = (
 
 def run_ffmpeg(command):
     """
-    Execute FFmpeg command and raise a useful error if FFmpeg fails.
-    Returns the completed subprocess.Process instance.
+    Run FFmpeg and raise an error if it fails.
     """
-    print("       Running FFmpeg...")
 
     process = subprocess.run(
         command,
@@ -45,7 +66,7 @@ def run_ffmpeg(command):
     if process.returncode != 0:
         print("\nFFmpeg ERROR:")
         print(process.stderr)
-        raise RuntimeError("FFmpeg command failed.\n" + process.stderr)
+        raise RuntimeError("FFmpeg command failed.")
 
     return process
 
@@ -56,111 +77,25 @@ def run_ffmpeg(command):
 
 def load_video_paths(video_folder):
     """
-    Find supported video files inside the folder and return their paths sorted.
+    Find all supported videos in a folder.
     """
+
     if not os.path.isdir(video_folder):
         raise FileNotFoundError(f"Video folder does not exist: {video_folder}")
 
     video_files = []
+
     for filename in os.listdir(video_folder):
         path = os.path.join(video_folder, filename)
+
         if not os.path.isfile(path):
             continue
+
         if filename.lower().endswith(VIDEO_EXTENSIONS):
             video_files.append(path)
 
     video_files.sort()
     return video_files
-
-
-# ============================================================
-# Process individual clip
-# ============================================================
-
-def process_clip(video_path, duration, output_path):
-    """
-    Create one normalized video clip.
-
-    Processing:
-        - random starting position
-        - exact duration
-        - 1280x720
-        - 30 FPS
-        - remove original audio
-        - H.264
-
-    FFmpeg handles everything directly.
-    """
-    if not os.path.exists(video_path):
-        raise FileNotFoundError(f"Video not found: {video_path}")
-
-    if duration <= 0:
-        raise ValueError(f"Invalid duration: {duration}")
-
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
-    # Get source duration
-    source_duration = get_video_duration(video_path)
-    if source_duration <= 0:
-        raise RuntimeError(f"Could not determine duration: {video_path}")
-
-    # Random start position
-    if source_duration > duration:
-        max_start = source_duration - duration
-        start_time = random.uniform(0, max_start)
-    else:
-        start_time = 0
-
-    duration = float(duration)
-
-    # Video filter: scale while preserving aspect, then pad/crop to exact size
-    video_filter = (
-        f"scale={TARGET_WIDTH}:{TARGET_HEIGHT}:"
-        f"force_original_aspect_ratio=decrease," 
-        f"pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2,"
-        f"setsar=1,fps={FPS}"
-    )
-
-    command = [
-        "ffmpeg",
-        "-y",
-        # Seek before decoding.
-        "-ss",
-        f"{start_time:.3f}",
-        "-i",
-        video_path,
-        # Exact output duration.
-        "-t",
-        f"{duration:.3f}",
-        # Video processing.
-        "-vf",
-        video_filter,
-        # Remove source audio.
-        "-an",
-        # H.264 encoder.
-        "-c:v",
-        "libx264",
-        # Quality.
-        "-crf",
-        str(CRF),
-        # Faster encoding.
-        "-preset",
-        PRESET,
-        # Pixel format compatible with most devices.
-        "-pix_fmt",
-        "yuv420p",
-        # Better seeking/streaming.
-        "-movflags",
-        "+faststart",
-        output_path,
-    ]
-
-    run_ffmpeg(command)
-
-    if not os.path.exists(output_path):
-        raise RuntimeError(f"FFmpeg did not create: {output_path}")
-
-    return output_path
 
 
 # ============================================================
@@ -171,6 +106,7 @@ def get_video_duration(video_path):
     """
     Get video duration using ffprobe.
     """
+
     command = [
         "ffprobe",
         "-v",
@@ -192,12 +128,89 @@ def get_video_duration(video_path):
     )
 
     if process.returncode != 0:
-        raise RuntimeError(f"ffprobe failed for {video_path}\n{process.stderr}")
+        raise RuntimeError(f"ffprobe failed:\n{process.stderr}")
 
     try:
         return float(process.stdout.strip())
     except (ValueError, TypeError):
-        raise RuntimeError(f"Invalid duration returned for: {video_path}")
+        raise RuntimeError(f"Invalid duration for: {video_path}")
+
+
+# ============================================================
+# Process individual clip
+# ============================================================
+
+def process_clip(video_path, duration, output_path):
+    """
+    Create one normalized clip.
+
+    Output:
+        1280x720
+        30 FPS
+        H.264
+        no audio
+    """
+
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"Video not found: {video_path}")
+
+    if duration <= 0:
+        raise ValueError(f"Invalid duration: {duration}")
+
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    source_duration = get_video_duration(video_path)
+    if source_duration <= 0:
+        raise RuntimeError(f"Invalid source duration: {video_path}")
+
+    if source_duration > duration:
+        max_start = source_duration - duration
+        start_time = random.uniform(0, max_start)
+    else:
+        start_time = 0
+
+    video_filter = (
+        f"scale={TARGET_WIDTH}:{TARGET_HEIGHT}:"
+        f"force_original_aspect_ratio=decrease,"
+        f"pad={TARGET_WIDTH}:{TARGET_HEIGHT}:"
+        f"(ow-iw)/2:(oh-ih)/2,"
+        f"setsar=1,"
+        f"fps={FPS}"
+    )
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-ss",
+        f"{start_time:.3f}",
+        "-i",
+        video_path,
+        "-t",
+        f"{duration:.3f}",
+        "-vf",
+        video_filter,
+        "-an",
+        "-c:v",
+        "libx264",
+        "-crf",
+        str(CRF),
+        "-preset",
+        PRESET,
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        output_path,
+    ]
+
+    run_ffmpeg(command)
+
+    if not os.path.exists(output_path):
+        raise RuntimeError(f"Clip was not created: {output_path}")
+
+    return output_path
 
 
 # ============================================================
@@ -208,24 +221,37 @@ def create_concat_file(clip_paths, concat_file):
     """
     Create FFmpeg concat demuxer file.
     """
+
     with open(concat_file, "w", encoding="utf-8") as file:
         for path in clip_paths:
-            escaped_path = os.path.abspath(path).replace("\\", "/").replace("'", "'\\''")
-            file.write(f"file '{escaped_path}'\n")
+            absolute_path = os.path.abspath(path).replace("\\", "/")
+            absolute_path = absolute_path.replace("'", "'\\''")
+            file.write(f"file '{absolute_path}'\n")
 
 
 # ============================================================
-# Concatenate videos
+# Concatenate normal clips
 # ============================================================
 
-def concatenate_videos(clip_paths, output_path):
+def concat_group(clip_paths, output_path):
     """
-    Concatenate already normalized clips using the concat demuxer.
+    Concatenate clips without transitions.
+
+    This is very fast because stream copy is used.
     """
+
     if not clip_paths:
-        raise ValueError("No clips to concatenate.")
+        raise ValueError("No clip paths provided for concatenation.")
 
-    concat_file = os.path.join(os.path.dirname(output_path), "concat.txt")
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    concat_file = os.path.join(
+        os.path.dirname(output_path),
+        f"concat_{random.randint(100000, 999999)}.txt",
+    )
+
     create_concat_file(clip_paths, concat_file)
 
     command = [
@@ -237,7 +263,6 @@ def concatenate_videos(clip_paths, output_path):
         "0",
         "-i",
         concat_file,
-        # Since all clips have identical format, stream copy is fast.
         "-c",
         "copy",
         "-movflags",
@@ -252,7 +277,175 @@ def concatenate_videos(clip_paths, output_path):
             os.remove(concat_file)
 
     if not os.path.exists(output_path):
-        raise RuntimeError("Combined video was not created.")
+        raise RuntimeError(f"Concatenated group was not created: {output_path}")
+
+    return output_path
+
+
+# ============================================================
+# Split clips into random groups
+# ============================================================
+
+def create_random_groups(clip_paths):
+    """
+    Split clips into random groups.
+
+    Each group contains 4-8 clips.
+
+    A transition will be added BETWEEN groups.
+    """
+
+    groups = []
+    index = 0
+    total = len(clip_paths)
+
+    while index < total:
+        remaining = total - index
+        if remaining <= TRANSITION_MAX_CLIPS:
+            group_size = remaining
+        else:
+            group_size = random.randint(TRANSITION_MIN_CLIPS, TRANSITION_MAX_CLIPS)
+            group_size = min(group_size, remaining)
+
+        groups.append(clip_paths[index:index + group_size])
+        index += group_size
+
+    return groups
+
+
+# ============================================================
+# Add random transitions
+# ============================================================
+
+def create_transition_video(group_paths, output_path):
+    """
+    Combine groups using random xfade transitions.
+
+    Only group boundaries receive transitions.
+    """
+
+    if not group_paths:
+        raise ValueError("No group paths provided for transition video.")
+
+    if len(group_paths) == 1:
+        return concat_group(group_paths, output_path)
+
+    print(f"       Adding {len(group_paths) - 1} random transitions...")
+
+    durations = [get_video_duration(path) for path in group_paths]
+
+    command = ["ffmpeg", "-y"]
+    for path in group_paths:
+        command.extend(["-i", path])
+
+    filters = []
+    cumulative_duration = durations[0]
+    previous_label = "[0:v]"
+
+    for i in range(1, len(group_paths)):
+        current_duration = durations[i]
+        transition = random.choice(TRANSITIONS)
+        transition_duration = min(
+            TRANSITION_DURATION,
+            durations[i - 1] / 2,
+            current_duration / 2,
+        )
+        transition_duration = max(0.10, transition_duration)
+        offset = cumulative_duration - transition_duration
+        output_label = f"[v{i}]"
+
+        filters.append(
+            f"{previous_label}[{i}:v]"
+            f"xfade=transition={transition}:duration={transition_duration:.3f}:offset={offset:.3f}"
+            f"{output_label}"
+        )
+
+        print(
+            f"       Transition {i}: {transition} "
+            f"({transition_duration:.2f}s)"
+        )
+
+        cumulative_duration = cumulative_duration + current_duration - transition_duration
+        previous_label = output_label
+
+    filter_complex = ";".join(filters)
+
+    command.extend([
+        "-filter_complex",
+        filter_complex,
+        "-map",
+        previous_label,
+        "-an",
+        "-c:v",
+        "libx264",
+        "-crf",
+        str(CRF),
+        "-preset",
+        PRESET,
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        output_path,
+    ])
+
+    run_ffmpeg(command)
+
+    if not os.path.exists(output_path):
+        raise RuntimeError("Transition video was not created.")
+
+    return output_path
+
+
+# ============================================================
+# Main concatenate function
+# ============================================================
+
+def concatenate_videos(clip_paths, output_path):
+    """
+    Concatenate clips with selective random transitions.
+
+    Example:
+
+        clips 1-6
+        ↓ transition
+        clips 7-12
+        ↓ transition
+        clips 13-17
+        ↓ transition
+        ...
+
+        Normal cuts happen inside each group.
+    """
+
+    if not clip_paths:
+        raise ValueError("No clips to concatenate.")
+
+    temp_dir = os.path.dirname(output_path)
+    if temp_dir:
+        os.makedirs(temp_dir, exist_ok=True)
+
+    groups = create_random_groups(clip_paths)
+    print(f"       Created {len(groups)} clip groups")
+
+    group_paths = []
+    for index, group in enumerate(groups, start=1):
+        group_output = os.path.join(temp_dir, f"group_{index:04d}.mp4")
+        print(
+            f"       Building group {index}/{len(groups)} "
+            f"({len(group)} clips)"
+        )
+        concat_group(group, group_output)
+        group_paths.append(group_output)
+
+    create_transition_video(group_paths, output_path)
+
+    for path in group_paths:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception as exc:
+            print(f"       Could not remove {path}: {exc}")
 
     return output_path
 
@@ -263,40 +456,41 @@ def concatenate_videos(clip_paths, output_path):
 
 def add_audio(video_path, audio_path, output_path):
     """
-    Add music to final video. Video is copied without re-encoding; audio is encoded.
+    Add music to the final video.
+
+    Video is copied without re-encoding.
+    Only audio is encoded.
     """
+
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video not found: {video_path}")
 
     if not os.path.exists(audio_path):
         raise FileNotFoundError(f"Audio not found: {audio_path}")
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
 
     command = [
         "ffmpeg",
         "-y",
         "-i",
         video_path,
-        # Loop audio indefinitely so it fills the video length.
         "-stream_loop",
         "-1",
         "-i",
         audio_path,
-        # Take video from first input, audio from second.
         "-map",
         "0:v:0",
         "-map",
         "1:a:0",
-        # Do not re-encode video.
         "-c:v",
         "copy",
-        # AAC audio.
         "-c:a",
         "aac",
         "-b:a",
         "192k",
-        # Stop when video ends.
         "-shortest",
         "-movflags",
         "+faststart",
@@ -309,3 +503,4 @@ def add_audio(video_path, audio_path, output_path):
         raise RuntimeError("Final video was not created.")
 
     return output_path
+
