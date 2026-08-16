@@ -1,435 +1,409 @@
-﻿import os
-import shutil
+import os
+import sys
+import tempfile
 import threading
-import traceback
-import tkinter as tk
+import shutil
+import streamlit as st
+from datetime import datetime
 
-from tkinter import ttk
-from tkinter import filedialog
-from tkinter import messagebox
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
-from app.beat import get_beats
-from app.sync import sync_clips_with_beats
-from app.video import (
-    concatenate_videos,
-    add_audio,
-)
+OUTPUT_DIR = os.path.join(ROOT, "output")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ============================================================
-# CONFIG
-# ============================================================
+from app.beat import analyze_music_full
+from app.video import analyze_video_full, process_clip, concatenate_videos, add_audio, encode_in_chunks, concat_group
+from app.sync import sync_clips_with_beats, ai_assign_clips
+from app.progress_tracker import ProgressTracker, create_default_stages
 
-APP_TITLE = "Beat Video Editor"
+st.set_page_config(page_title="Beat Video Editor", layout="wide", initial_sidebar_state="collapsed")
 
-VIDEO_EXTENSIONS = (
-    ".mp4",
-    ".mov",
-    ".webm",
-    ".mkv",
-)
 
-AUDIO_EXTENSIONS = (
-    ".mp3",
-    ".wav",
-    ".m4a",
-    ".aac",
-)
+def run_generation(tracker, temp_dir, output_dir, video_paths, music_path, params):
+    """Background thread for video generation."""
+    try:
+        # STAGE 1: Music Analysis
+        tracker.start_stage(0, "Analyzing music...")
+        music_analysis = analyze_music_full(music_path, cache_dir=os.path.join(temp_dir, "cache"))
+        beats = music_analysis.get("beats", [])
+        if len(beats) < 2:
+            raise RuntimeError("Not enough beats detected in music.")
+        tracker.complete_stage(0)
 
-# ============================================================
-# GUI
-# ============================================================
+        # STAGE 2: Video Analysis
+        tracker.start_stage(1, "Analyzing videos...")
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-class BeatVideoEditor:
+        def analyze_one(vp):
+            analysis = analyze_video_full(vp, cache_dir=os.path.join(temp_dir, "cache"), fast_mode=True)
+            return analysis
 
-    def __init__(self, root):
-        self.root = root
-        self.root.title(APP_TITLE)
-        self.root.geometry("950x760")
-        self.root.minsize(900, 700)
-
-        self.music_path = tk.StringVar()
-        self.video_folder = tk.StringVar()
-        self.output_folder = tk.StringVar(value=os.path.abspath("output"))
-        self.min_beats = tk.IntVar(value=4)
-        self.max_beats = tk.IntVar(value=8)
-        self.enable_transitions = tk.BooleanVar(value=True)
-        self.transition_min = tk.IntVar(value=4)
-        self.transition_max = tk.IntVar(value=8)
-        self.transition_duration = tk.DoubleVar(value=0.35)
-        self.resolution = tk.StringVar(value="1080p")
-        self.quality = tk.StringVar(value="Very High")
-        self.status = tk.StringVar(value="Ready")
-        self.is_running = False
-
-        self.build_ui()
-
-    def build_ui(self):
-        main = ttk.Frame(self.root, padding=20)
-        main.pack(fill="both", expand=True)
-
-        ttk.Label(
-            main,
-            text="🎬 Beat Video Editor",
-            font=("Segoe UI", 24, "bold"),
-        ).pack(anchor="w")
-
-        ttk.Label(
-            main,
-            text=(
-                "Random unique clips • "
-                "Ascending flow • "
-                "Beat synchronization • "
-                "Selective transitions"
-            ),
-            font=("Segoe UI", 10),
-        ).pack(anchor="w", pady=(2, 15))
-
-        files = ttk.LabelFrame(main, text="📁 Input / Output", padding=15)
-        files.pack(fill="x", pady=5)
-        files.columnconfigure(1, weight=1)
-
-        ttk.Label(files, text="🎵 Music").grid(row=0, column=0, sticky="w", pady=7)
-        ttk.Entry(files, textvariable=self.music_path).grid(row=0, column=1, padx=10, sticky="ew")
-        ttk.Button(files, text="Browse", command=self.select_music).grid(row=0, column=2)
-
-        ttk.Label(files, text="🎬 Video Folder").grid(row=1, column=0, sticky="w", pady=7)
-        ttk.Entry(files, textvariable=self.video_folder).grid(row=1, column=1, padx=10, sticky="ew")
-        ttk.Button(files, text="Select Folder", command=self.select_video_folder).grid(row=1, column=2)
-
-        ttk.Label(files, text="📂 Output Folder").grid(row=2, column=0, sticky="w", pady=7)
-        ttk.Entry(files, textvariable=self.output_folder).grid(row=2, column=1, padx=10, sticky="ew")
-        ttk.Button(files, text="Select Folder", command=self.select_output_folder).grid(row=2, column=2)
-
-        settings = ttk.LabelFrame(main, text="⚙️ Video Settings", padding=15)
-        settings.pack(fill="x", pady=10)
-
-        ttk.Label(settings, text="Minimum beats / clip").grid(row=0, column=0, sticky="w", pady=6)
-        ttk.Spinbox(settings, from_=2, to=20, textvariable=self.min_beats, width=10).grid(row=0, column=1, padx=10, sticky="w")
-        ttk.Label(settings, text="Maximum beats / clip").grid(row=0, column=2, sticky="w", pady=6)
-        ttk.Spinbox(settings, from_=3, to=30, textvariable=self.max_beats, width=10).grid(row=0, column=3, padx=10, sticky="w")
-
-        ttk.Label(settings, text="Resolution").grid(row=1, column=0, sticky="w", pady=6)
-        ttk.Combobox(
-            settings,
-            textvariable=self.resolution,
-            values=["720p", "1080p", "Original"],
-            state="readonly",
-            width=12,
-        ).grid(row=1, column=1, padx=10, sticky="w")
-
-        ttk.Label(settings, text="Quality").grid(row=1, column=2, sticky="w")
-        ttk.Combobox(
-            settings,
-            textvariable=self.quality,
-            values=["Balanced", "High", "Very High"],
-            state="readonly",
-            width=12,
-        ).grid(row=1, column=3, padx=10, sticky="w")
-
-        transitions = ttk.LabelFrame(main, text="🎞️ Selective Random Transitions", padding=15)
-        transitions.pack(fill="x", pady=5)
-
-        self.transition_check = ttk.Checkbutton(
-            transitions,
-            text=(
-                "Enable random transitions "
-                "(not between every clip)"
-            ),
-            variable=self.enable_transitions,
-            command=self.update_transition_state,
-        )
-        self.transition_check.grid(row=0, column=0, columnspan=4, sticky="w", pady=5)
-
-        ttk.Label(transitions, text="Every minimum").grid(row=1, column=0, sticky="w")
-        self.transition_min_box = ttk.Spinbox(
-            transitions,
-            from_=2,
-            to=20,
-            textvariable=self.transition_min,
-            width=10,
-        )
-        self.transition_min_box.grid(row=1, column=1, padx=10, sticky="w")
-
-        ttk.Label(transitions, text="Every maximum").grid(row=1, column=2, sticky="w")
-        self.transition_max_box = ttk.Spinbox(
-            transitions,
-            from_=3,
-            to=30,
-            textvariable=self.transition_max,
-            width=10,
-        )
-        self.transition_max_box.grid(row=1, column=3, padx=10, sticky="w")
-
-        ttk.Label(transitions, text="Duration").grid(row=2, column=0, sticky="w", pady=8)
-        self.transition_duration_box = ttk.Combobox(
-            transitions,
-            textvariable=self.transition_duration,
-            values=[0.20, 0.25, 0.30, 0.35, 0.40, 0.50],
-            state="readonly",
-            width=10,
-        )
-        self.transition_duration_box.grid(row=2, column=1, padx=10, sticky="w")
-
-        ttk.Label(transitions, text="Recommended: 0.35 sec").grid(row=2, column=2, columnspan=2, sticky="w")
-
-        self.generate_button = ttk.Button(main, text="🚀 Generate Video", command=self.start_generation)
-        self.generate_button.pack(fill="x", pady=(15, 8), ipady=8)
-
-        self.progress = ttk.Progressbar(main, mode="determinate", maximum=100)
-        self.progress.pack(fill="x", pady=5)
-
-        ttk.Label(main, textvariable=self.status, font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=5)
-
-        log_frame = ttk.LabelFrame(main, text="📋 Progress Log", padding=5)
-        log_frame.pack(fill="both", expand=True)
-
-        self.log_text = tk.Text(log_frame, height=10, wrap="word", state="disabled")
-        scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=scrollbar.set)
-        self.log_text.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        self.update_transition_state()
-
-    def select_music(self):
-        path = filedialog.askopenfilename(
-            title="Select Music",
-            filetypes=[
-                ("Audio Files", "*.mp3 *.wav *.m4a *.aac"),
-                ("All Files", "*.*"),
-            ],
-        )
-        if path:
-            self.music_path.set(path)
-
-    def select_video_folder(self):
-        path = filedialog.askdirectory(title="Select Video Folder")
-        if path:
-            self.video_folder.set(path)
-            videos = self.find_videos(path)
-            self.log(f"Found {len(videos)} source videos.")
-
-    def select_output_folder(self):
-        path = filedialog.askdirectory(title="Select Output Folder")
-        if path:
-            self.output_folder.set(path)
-
-    def find_videos(self, folder):
-        videos = []
-        if not os.path.isdir(folder):
-            return videos
-        for filename in os.listdir(folder):
-            path = os.path.join(folder, filename)
-            if not os.path.isfile(path):
-                continue
-            if filename.lower().endswith(VIDEO_EXTENSIONS):
-                videos.append(path)
-        return videos
-
-    def update_transition_state(self):
-        enabled = self.enable_transitions.get()
-        state = "normal" if enabled else "disabled"
-        self.transition_min_box.configure(state=state)
-        self.transition_max_box.configure(state=state)
-        self.transition_duration_box.configure(state="readonly" if enabled else "disabled")
-
-    def log(self, message):
-        def update():
-            self.log_text.configure(state="normal")
-            self.log_text.insert("end", str(message) + "\n")
-            self.log_text.see("end")
-            self.log_text.configure(state="disabled")
-        self.root.after(0, update)
-
-    def set_status(self, message):
-        self.root.after(0, lambda: self.status.set(message))
-
-    def set_progress(self, value):
-        self.root.after(0, lambda: self.progress.configure(value=value))
-
-    def start_generation(self):
-        if self.is_running:
-            return
-
-        music = self.music_path.get()
-        video_folder = self.video_folder.get()
-        output_folder = self.output_folder.get()
-
-        if not music:
-            messagebox.showerror("Missing Music", "Please select a music file.")
-            return
-
-        if not os.path.isfile(music):
-            messagebox.showerror("Invalid Music", "Music file does not exist.")
-            return
-
-        if not video_folder:
-            messagebox.showerror("Missing Videos", "Please select a video folder.")
-            return
-
-        if not os.path.isdir(video_folder):
-            messagebox.showerror("Invalid Folder", "Video folder does not exist.")
-            return
-
-        videos = self.find_videos(video_folder)
-        if not videos:
-            messagebox.showerror("No Videos", "No supported videos found.")
-            return
-
-        try:
-            min_beats = int(self.min_beats.get())
-            max_beats = int(self.max_beats.get())
-            if min_beats > max_beats:
-                messagebox.showerror(
-                    "Invalid Settings",
-                    "Minimum beats cannot be greater than maximum beats.",
+        video_analyses = []
+        max_workers = min(len(video_paths), 4)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(analyze_one, vp): vp for vp in video_paths}
+            for i, future in enumerate(as_completed(futures)):
+                analysis = future.result()
+                video_analyses.append(analysis)
+                tracker.update_stats(
+                    videos_analyzed=i + 1,
+                    total_videos=len(video_paths),
+                    scenes_detected=sum(len(a['scenes']) for a in video_analyses)
                 )
-                return
-        except Exception:
-            messagebox.showerror("Invalid Settings", "Invalid beat settings.")
-            return
+                tracker.update_stage_progress(1, (i + 1) / len(video_paths))
+        tracker.complete_stage(1)
 
-        os.makedirs(output_folder, exist_ok=True)
-        self.is_running = True
-        self.generate_button.configure(state="disabled")
-        self.progress["value"] = 0
-        self.log_text.configure(state="normal")
-        self.log_text.delete("1.0", "end")
-        self.log_text.configure(state="disabled")
-
-        thread = threading.Thread(
-            target=self.generate_video,
-            args=(music, videos, output_folder),
-            daemon=True,
+        # STAGE 3: Beat Groups & Clip Discovery
+        tracker.start_stage(2, "Creating beat groups...")
+        tracker.update_stage_progress(2, 0.3, "Discovering candidate clips...")
+        cache_dir = os.path.join(temp_dir, "cache")
+        reuse_limit = int(params['max_clips_per_source']) if params['max_clips_per_source'] > 0 else None
+        ai_results, beat_groups, debug_scores, all_candidates = ai_assign_clips(
+            beats,
+            video_paths,
+            min_beats=int(params['min_beats']),
+            max_beats=int(params['max_beats']),
+            sample_interval=float(params['sample_interval']),
+            scene_threshold=float(params['scene_threshold']),
+            reuse_limit=reuse_limit,
+            compute_motion=bool(params['compute_motion']),
+            cache_dir=cache_dir,
+            music_analysis=music_analysis,
+            video_analyses=video_analyses,
         )
-        thread.start()
 
-    def generate_video(self, music_path, video_paths, output_folder):
-        temp_dir = None
-        try:
-            import app.video as video_module
+        if not ai_results:
+            raise RuntimeError("No clips could be generated.")
+        tracker.update_stage_progress(2, 0.7, "Scoring & matching clips...")
+        tracker.update_stats(
+            clips_generated=len(ai_results),
+            target_duration=sum(bg.get('duration', 0) for bg in beat_groups)
+        )
+        tracker.complete_stage(2)
 
-            resolution = self.resolution.get()
-            if resolution == "720p":
-                video_module.TARGET_WIDTH = 1280
-                video_module.TARGET_HEIGHT = 720
-            elif resolution == "1080p":
-                video_module.TARGET_WIDTH = 1920
-                video_module.TARGET_HEIGHT = 1080
-            else:
-                video_module.TARGET_WIDTH = 1920
-                video_module.TARGET_HEIGHT = 1080
+        # STAGE 4: Process Clips
+        tracker.start_stage(3, "Building timeline...")
+        tracker.update_stage_progress(3, 0.5, "Processing clips...")
+        clip_dir = os.path.join(temp_dir, "_final_clips")
+        os.makedirs(clip_dir, exist_ok=True)
 
-            quality = self.quality.get()
-            if quality == "Very High":
-                video_module.QSV_QUALITY = 18
-            elif quality == "High":
-                video_module.QSV_QUALITY = 20
-            else:
-                video_module.QSV_QUALITY = 22
+        final_clip_paths = []
+        used_beat_groups = []
+        total = len(ai_results)
 
-            video_module.TRANSITION_DURATION = float(self.transition_duration.get())
-            video_module.TRANSITION_MIN_CLIPS = int(self.transition_min.get())
-            video_module.TRANSITION_MAX_CLIPS = int(self.transition_max.get())
+        for index, assignment in enumerate(ai_results):
+            source_path = assignment["source_path"]
+            duration = assignment["clip_duration"]
+            start_time = assignment["source_start"]
+            beat_group = {
+                "start": assignment["music_start"],
+                "end": assignment["music_end"],
+                "duration": duration,
+            }
 
-            self.set_status("Analyzing music...")
-            self.log("[1/5] Analyzing music...")
-            beats = get_beats(music_path)
-            if len(beats) < 2:
-                raise RuntimeError("Not enough beats detected.")
-            self.log(f"Detected {len(beats)} beats.")
-            self.set_progress(10)
+            clip_path = os.path.join(clip_dir, f"clip_{index + 1:04d}.mp4")
 
-            self.set_status("Preparing source videos...")
-            self.log("\n[2/5] Preparing source videos...")
-            self.log(f"Available videos: {len(video_paths)}")
-            self.set_progress(15)
-
-            self.set_status("Generating beat-synchronized clips...")
-            self.log("\n[3/5] Generating clips...")
-
-            def progress_callback(current, total):
-                percentage = 15 + (current / max(total, 1)) * 45
-                self.set_progress(percentage)
-                self.set_status(f"Generating clip {current}/{total}...")
-                temp_clip_paths, beat_groups, temp_dir = sync_clips_with_beats(
-                    video_paths,
-                    beats,
-                    min_beats=int(self.min_beats.get()),
-                    max_beats=int(self.max_beats.get()),
-                    progress_callback=progress_callback,
-                )
-
-                if not temp_clip_paths:
-                    raise RuntimeError("No clips were generated.")
-
-                self.log(f"Created {len(temp_clip_paths)} clips.")
-                self.set_progress(60)
-
-                self.set_status("Creating final video...")
-                self.log("\n[4/5] Creating final video...")
-                os.makedirs(output_folder, exist_ok=True)
-                video_without_audio = os.path.join(output_folder, "_video_without_audio.mp4")
-
-                if self.enable_transitions.get():
-                    self.log("Adding selective random transitions...")
-                    concatenate_videos(temp_clip_paths, video_without_audio, beat_groups=beat_groups,
-                                       transition_min=self.transition_min.get(),
-                                       transition_max=self.transition_max.get(),
-                                       transition_duration=self.transition_duration.get())
-                else:
-                    self.log("Combining clips without transitions...")
-                    from app.video import concat_group
-                    concat_group(temp_clip_paths, video_without_audio)
-
-                self.set_progress(80)
-
-                self.set_status("Adding music...")
-                self.log("\n[5/5] Adding music...")
-                final_path = os.path.join(output_folder, "final.mp4")
-                add_audio(video_path=video_without_audio, audio_path=music_path, output_path=final_path)
-                self.set_progress(100)
-
-                if os.path.exists(video_without_audio):
-                    os.remove(video_without_audio)
-
-                self.set_status("✅ Video generated successfully!")
-                self.log("\n======================================")
-                self.log("       VIDEO GENERATION COMPLETE")
-                self.log("======================================")
-            self.log(f"\nOutput:\n{final_path}")
-
-            self.root.after(
-                0,
-                lambda: messagebox.showinfo(
-                    "Success",
-                    ("Video generated successfully!\n\n" f"{final_path}"),
-                ),
+            process_clip(
+                video_path=source_path,
+                duration=duration,
+                output_path=clip_path,
+                start_time=start_time,
+                snap_frame=True,
             )
 
+            final_clip_paths.append(clip_path)
+            used_beat_groups.append({
+                "clip_path": clip_path,
+                "source_path": source_path,
+                "music_start": beat_group["start"],
+                "music_end": beat_group["end"],
+                "clip_duration": duration,
+                "source_start": start_time,
+                "score": assignment["score"],
+                "scene_flag": assignment["scene_flag"],
+                "motion_score": assignment.get("motion_score", 0.0),
+                "beat_strength": assignment.get("beat_strength", 0.5),
+                "beat_energy": assignment.get("beat_energy", 0.5),
+                "beat_type": assignment.get("beat_type", "regular"),
+            })
+
+            tracker.update_stats(
+                clips_generated=index + 1,
+                generated_duration=sum(bg["clip_duration"] for bg in used_beat_groups)
+            )
+            tracker.update_stage_progress(3, (index + 1) / total)
+
+        tracker.complete_stage(3)
+
+        # STAGE 5: Concatenate & Transitions
+        tracker.start_stage(4, "Planning transitions...")
+        tracker.update_stage_progress(4, 0.3, "Planning transitions...")
+        tracker.update_stage_progress(4, 0.7, "Concatenating clips...")
+        video_no_audio = os.path.join(output_dir, "_video_no_audio.mp4")
+
+        if params['use_transitions']:
+            concatenate_videos(
+                final_clip_paths,
+                video_no_audio,
+                beat_groups=used_beat_groups,
+                transition_min=4,
+                transition_max=8,
+                transition_duration=float(params['transition_duration']),
+            )
+        else:
+            concat_group(final_clip_paths, video_no_audio)
+
+        tracker.complete_stage(4)
+
+        # STAGE 6: Low-RAM Re-encode (Optional)
+        tracker.start_stage(5, "Rendering video...")
+        final_input = video_no_audio
+        if params['use_low_ram']:
+            encoded_tmp = os.path.join(output_dir, "_video_encoded.mp4")
             try:
-                os.startfile(output_folder)
+                def enc_progress(cur, total):
+                    tracker.update_stage_progress(5, cur / max(total, 1))
+                encode_in_chunks(
+                    video_no_audio,
+                    encoded_tmp,
+                    segment_time=int(params['chunk_size']),
+                    progress_callback=enc_progress,
+                )
+                final_input = encoded_tmp
             except Exception:
                 pass
 
-        except Exception as exc:
-            self.set_status("❌ Generation failed")
-            self.log("\nERROR:")
-            self.log(str(exc))
-            self.log("\n" + traceback.format_exc())
-            self.root.after(0, lambda: messagebox.showerror("Generation Failed", str(exc)))
-            if temp_dir:
-                shutil.rmtree(temp_dir, ignore_errors=True)
+        tracker.update_stage_progress(5, 0.8, "Finalizing render...")
+        tracker.complete_stage(5)
 
-        finally:
-            self.is_running = False
-            self.root.after(0, lambda: self.generate_button.configure(state="normal"))
+        # STAGE 7: Add Audio
+        tracker.start_stage(6, "Adding music...")
+        final_filename = f"beat_edit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
+        final_path = os.path.join(OUTPUT_DIR, final_filename)
+        add_audio(final_input, music_path, final_path)
+        tracker.complete_stage(6)
+
+        # STAGE 8: Finalizing
+        tracker.start_stage(7, "Finalizing...")
+        tracker.update_stage_progress(7, 1.0)
+        tracker.complete_stage(7)
+
+        st.session_state.generation_result = {"success": True, "final_path": final_path, "final_filename": final_filename}
+    except Exception as exc:
+        st.session_state.generation_result = {"success": False, "error": str(exc)}
+    finally:
+        st.session_state.generation_running = False
+        if music_path and os.path.exists(music_path):
+            try:
+                os.remove(music_path)
+            except Exception:
+                pass
+        # Clean up temp directory
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+@st.fragment(run_every=1)
+def progress_dashboard(tracker: ProgressTracker):
+    """Progress dashboard fragment that updates every second."""
+    data = tracker.get_dashboard_data()
+
+    st.markdown(f"### {data['current_stage']}")
+    st.progress(data['overall_progress'] / 100)
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Progress", f"{data['overall_progress']}%")
+    with col2:
+        st.metric("Elapsed", data['elapsed'])
+    with col3:
+        st.metric("Remaining", data['eta'])
+    with col4:
+        st.metric("Timeline", data['stats']['timeline_progress'])
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Videos Processed", data['stats']['videos_analyzed'])
+    with col2:
+        st.metric("Scenes Detected", data['stats']['scenes_detected'])
+    with col3:
+        st.metric("Clips Generated", data['stats']['clips_generated'])
+    with col4:
+        st.metric("Generated Duration", data['stats']['generated_duration'])
+
+
+def get_generated_videos():
+    """Get list of previously generated videos from output directory."""
+    videos = []
+    if os.path.exists(OUTPUT_DIR):
+        for f in os.listdir(OUTPUT_DIR):
+            if f.endswith(".mp4") and f.startswith("beat_edit_"):
+                path = os.path.join(OUTPUT_DIR, f)
+                stat = os.stat(path)
+                videos.append({
+                    "filename": f,
+                    "path": path,
+                    "size_mb": round(stat.st_size / (1024 * 1024), 1),
+                    "created": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+                })
+    return sorted(videos, key=lambda x: x["created"], reverse=True)
 
 
 def main():
-    root = tk.Tk()
-    BeatVideoEditor(root)
-    root.mainloop()
+    st.title("Beat Video Editor")
+    st.caption("Upload videos + music → AI creates beat-synced edit automatically")
+
+    with st.sidebar:
+        st.header("Upload")
+        video_files = st.file_uploader(
+            "Source videos",
+            type=["mp4", "mov", "webm", "mkv"],
+            accept_multiple_files=True,
+            help="Upload one or more full-length videos"
+        )
+        music_file = st.file_uploader(
+            "Music track",
+            type=["mp3", "wav", "m4a", "aac"],
+            help="Upload the music/audio track"
+        )
+
+        st.markdown("---")
+        st.header("Advanced (Optional)")
+        with st.expander("Processing Options"):
+            min_beats = st.number_input("Min beats per clip", 1, 20, 4)
+            max_beats = st.number_input("Max beats per clip", 1, 40, 8)
+            max_clips_per_source = st.number_input("Max clips per source video (0=auto)", 0, 50, 0)
+            sample_interval = st.number_input("Candidate sample interval (s)", 0.1, 5.0, 2.0, 0.1)
+            scene_threshold = st.number_input("Scene threshold", 0.05, 0.8, 0.4, 0.05)
+            compute_motion = st.checkbox("Compute motion (optical flow)", False)
+            use_transitions = st.checkbox("Add transitions", True)
+            transition_duration = st.selectbox("Transition duration (s)", [0.2, 0.25, 0.3, 0.35, 0.4, 0.5], index=3)
+            use_low_ram = st.checkbox("Low-RAM chunked encoding", True)
+            chunk_size = st.number_input("Chunk size (s)", 10, 300, 60)
+
+    # Show previously generated videos
+    generated_videos = get_generated_videos()
+    if generated_videos:
+        with st.expander(f"📁 Previous Videos ({len(generated_videos)})", expanded=False):
+            for vid in generated_videos:
+                col1, col2, col3, col4 = st.columns([3, 1, 1, 1])
+                with col1:
+                    st.text(vid["filename"])
+                with col2:
+                    st.text(f"{vid['size_mb']} MB")
+                with col3:
+                    st.text(vid["created"])
+                with col4:
+                    with open(vid["path"], "rb") as f:
+                        st.download_button(
+                            "Download",
+                            data=f.read(),
+                            file_name=vid["filename"],
+                            mime="video/mp4",
+                            key=f"dl_{vid['filename']}",
+                            use_container_width=True
+                        )
+                st.video(vid["path"])
+
+    st.markdown("---")
+
+    if "generation_running" not in st.session_state:
+        st.session_state.generation_running = False
+    if "generation_result" not in st.session_state:
+        st.session_state.generation_result = None
+
+    if not st.session_state.generation_running:
+        if st.button("Generate AI Video", type="primary", use_container_width=True):
+            if not video_files:
+                st.error("Please upload at least one video file.")
+                st.stop()
+            if not music_file:
+                st.error("Please upload a music file.")
+                st.stop()
+            if min_beats > max_beats:
+                st.error("Minimum beats cannot exceed maximum beats.")
+                st.stop()
+
+            temp_dir = tempfile.mkdtemp(prefix="beats_editor_")
+            output_dir = os.path.join(temp_dir, "output")
+            os.makedirs(output_dir, exist_ok=True)
+
+            music_ext = os.path.splitext(music_file.name)[1]
+            music_path = os.path.join(temp_dir, f"music{music_ext}")
+            with open(music_path, "wb") as f:
+                f.write(music_file.getbuffer())
+
+            video_paths = []
+            for idx, vf in enumerate(video_files):
+                ext = os.path.splitext(vf.name)[1]
+                vp = os.path.join(temp_dir, f"video_{idx}{ext}")
+                with open(vp, "wb") as f:
+                    f.write(vf.getbuffer())
+                video_paths.append(vp)
+
+            total_duration = 0.0
+            try:
+                import cv2
+                cap = cv2.VideoCapture(video_paths[0])
+                fps = cap.get(cv2.CAP_PROP_FPS) or 30
+                frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                total_duration = frame_count / fps if fps > 0 else 0
+                cap.release()
+            except Exception:
+                total_duration = 60.0
+
+            stages = create_default_stages(total_duration)
+            tracker = ProgressTracker(stages, total_duration)
+
+            st.session_state.tracker = tracker
+            st.session_state.temp_dir = temp_dir
+            st.session_state.output_dir = output_dir
+            st.session_state.video_paths = video_paths
+            st.session_state.music_path = music_path
+            st.session_state.params = {
+                'min_beats': min_beats,
+                'max_beats': max_beats,
+                'max_clips_per_source': max_clips_per_source,
+                'sample_interval': sample_interval,
+                'scene_threshold': scene_threshold,
+                'compute_motion': compute_motion,
+                'use_transitions': use_transitions,
+                'transition_duration': transition_duration,
+                'use_low_ram': use_low_ram,
+                'chunk_size': chunk_size,
+            }
+            st.session_state.generation_running = True
+            st.session_state.generation_result = None
+
+            thread = threading.Thread(
+                target=run_generation,
+                args=(tracker, temp_dir, output_dir, video_paths, music_path, st.session_state.params),
+                daemon=True
+            )
+            thread.start()
+            st.rerun()
+
+    if st.session_state.generation_running:
+        progress_dashboard(st.session_state.tracker)
+    elif st.session_state.generation_result:
+        result = st.session_state.generation_result
+        if result["success"]:
+            st.success("Video generated successfully!")
+            with open(result["final_path"], "rb") as f:
+                st.download_button(
+                    "Download Final Video",
+                    data=f.read(),
+                    file_name=result["final_filename"],
+                    mime="video/mp4",
+                    use_container_width=True,
+                )
+            st.video(result["final_path"])
+        else:
+            st.error(f"Generation failed: {result['error']}")
 
 
 if __name__ == "__main__":

@@ -3,3 +3,6 @@ numpy
 soundfile
 scipy
 numba
+streamlit
+opencv-python
+Pillow
