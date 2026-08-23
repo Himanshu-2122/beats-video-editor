@@ -3,6 +3,9 @@ import random
 import math
 import tempfile
 import json
+import time
+import numpy as np
+from pathlib import Path
 from typing import Optional, Union, List, Dict
 
 from app.video import (
@@ -259,6 +262,7 @@ def _greedy_assign(
     cache_dir: str = None,
     music_analysis: dict = None,
     video_analyses: list = None,  # Pre-computed video analyses for cached scenes
+    pre_generated_candidates: dict = None,  # Pre-generated candidates from caller
 ) -> list[dict]:
     """
     Greedy assignment of clips to beats using:
@@ -269,6 +273,26 @@ def _greedy_assign(
     - Beat energy matching (music-aware)
     - Beat type classification (downbeat, drop, buildup, regular)
     """
+    print(f"\n{'='*60}")
+    print(f"[DIAG] _greedy_assign START")
+    print(f"       beat_groups: {len(beat_groups)}")
+    print(f"       video_paths: {len(video_paths)}")
+    print(f"       reuse_limit: {reuse_limit}")
+    print(f"       compute_motion: {compute_motion}")
+    print(f"       pre_generated_candidates provided: {pre_generated_candidates is not None}")
+    if pre_generated_candidates:
+        total_cands = sum(len(cands) for vp in video_paths for cands in pre_generated_candidates.get(vp, {}).values())
+        durations = set()
+        for vp in video_paths:
+            durations.update(pre_generated_candidates.get(vp, {}).keys())
+        print(f"       pre_generated total candidates: {total_cands}")
+        print(f"       pre_generated durations: {sorted(durations)}")
+        for vp in video_paths:
+            vp_cands = pre_generated_candidates.get(vp, {})
+            for dur, cands in vp_cands.items():
+                print(f"         {os.path.basename(vp)} dur={dur:.2f}s: {len(cands)} candidates")
+    print(f"{'='*60}\n")
+    
     assignments = []
     video_usage_count = {v: 0 for v in video_paths}
     used_source_intervals = {v: [] for v in video_paths}
@@ -284,39 +308,112 @@ def _greedy_assign(
         for va in video_analyses:
             video_highlights[va.get("path")] = va.get("highlights", [])
 
-    # Pre-generate candidates for each video (using first group's duration as reference)
-    all_candidates = {}
     # Track the earliest allowed timestamp per video for chronological ordering
     video_cursors = {vp: 0.0 for vp in video_paths}
-    for vp in video_paths:
-        duration = beat_groups[0]["duration"] if beat_groups else 1.0
+    
+    # Use pre-generated candidates if provided, otherwise generate them
+    if pre_generated_candidates is not None:
+        all_candidates = pre_generated_candidates
+        # Extract unique durations from pre-generated candidates
+        unique_durations = set()
+        for vp_cands in all_candidates.values():
+            unique_durations.update(vp_cands.keys())
+        unique_durations = sorted(unique_durations)
+    else:
+        # Pre-generate candidates for each video for ALL unique durations needed
+        all_candidates = {}
         
-        # Find cached scenes for this video
-        cached_scenes = None
-        if video_analyses:
-            for va in video_analyses:
-                if va.get("path") == vp:
-                    cached_scenes = va.get("scenes", [])
-                    break
+        # Get unique durations from beat groups (bucketed to 0.05s to reduce count while minimizing mismatch)
+        def bucket_duration(d):
+            return round(d * 20) / 20  # 0.05s buckets
         
-        candidates = generate_candidates(
-            vp,
-            duration,
-            sample_interval=sample_interval,
-            scene_threshold=scene_threshold,
-            max_candidates=MAX_CANDIDATES_PER_SOURCE,
-            compute_motion=compute_motion,
-            cache_dir=cache_dir,
-            cached_scenes=cached_scenes,
-        )
-        all_candidates[vp] = candidates
+        unique_durations = sorted(set(bucket_duration(bg["duration"]) for bg in beat_groups))
+        
+        print(f"       Pre-generating candidates for {len(unique_durations)} unique durations (0.05s buckets): {unique_durations}")
+        
+        for vp in video_paths:
+            all_candidates[vp] = {}
+            
+            # Find cached scenes for this video
+            cached_scenes = None
+            if video_analyses:
+                for va in video_analyses:
+                    if va.get("path") == vp:
+                        cached_scenes = va.get("scenes", [])
+                        break
+            
+            for duration in unique_durations:
+                candidates = generate_candidates(
+                    vp,
+                    duration,
+                    sample_interval=sample_interval,
+                    scene_threshold=scene_threshold,
+                    max_candidates=MAX_CANDIDATES_PER_SOURCE,
+                    compute_motion=compute_motion,
+                    cache_dir=cache_dir,
+                    cached_scenes=cached_scenes,
+                )
+                all_candidates[vp][duration] = candidates
+    
+    # Map actual duration -> bucketed duration for lookup
+    def bucket_duration(d):
+        return round(d * 20) / 20  # 0.05s buckets
+    duration_to_bucket = {bg["duration"]: bucket_duration(bg["duration"]) for bg in beat_groups}
 
     # Debug: collect scores per beat
     debug_scores = {}
+    
+    
 
+    # Diagnostic counters
+    total_stats = {
+        'total_examined': 0,
+        'rejected_duration': 0,
+        'rejected_overlap': 0,
+        'rejected_cursor': 0,
+        'rejected_reuse_limit': 0,
+        'rejected_overlap_final': 0,
+        'rejected_score': 0,
+        'fallback_used': 0,
+        'fallback_failed': 0,
+        'assigned': 0,
+    }
+    
     for beat_idx, beat_group in enumerate(beat_groups):
         beat_time = beat_group["start"]
         duration = beat_group["duration"]
+        # Use bucketed duration (0.05s) to match pre-generated candidates
+        bucketed_duration = round(duration * 20) / 20
+        
+        # EARLY EXIT: Only when we generated candidates ourselves (same bucketing)
+        # When pre_generated_candidates is passed (from Hungarian), bucketing may differ
+        if pre_generated_candidates is None:
+            # Find closest available duration for each video
+            def find_closest_duration(vp, target):
+                durations = list(all_candidates.get(vp, {}).keys())
+                if not durations:
+                    return None
+                return min(durations, key=lambda d: abs(d - target))
+            
+            has_candidates = False
+            for vp in video_paths:
+                closest_dur = find_closest_duration(vp, bucketed_duration)
+                if closest_dur is not None and all_candidates.get(vp, {}).get(closest_dur):
+                    has_candidates = True
+                    break
+            
+            if not has_candidates:
+                debug_scores[beat_idx] = []
+                print(f"       [DIAG] Beat {beat_idx}: NO CANDIDATES for bucketed_dur={bucketed_duration:.2f}s (beat_time={beat_time:.2f}s)")
+                continue
+        
+        beat_start = time.perf_counter()
+        
+        if beat_idx % 10 == 0:
+            print(f"       Processing beat group {beat_idx+1}/{len(beat_groups)}...", flush=True)
+        
+        # Time the scoring loop
+        score_start = time.perf_counter()
         
         # Find the corresponding beat in music analysis for energy/type
         beat_info = None
@@ -335,112 +432,199 @@ def _greedy_assign(
         best_candidate = None
         best_video = None
         beat_scores = []
-
+        
+        candidates_considered = 0
+        candidates_filtered_overlap = 0
+        candidates_filtered_cursor = 0
+        candidates_filtered_duration = 0
+        
+        # Per-beat diagnostics
+        beat_diag = {
+            'total_candidates': 0,
+            'after_duration_filter': 0,
+            'after_cursor_filter': 0,
+            'after_overlap_filter': 0,
+            'after_reuse_filter': 0,
+            'scored': 0,
+            'selected': None,
+            'fallback_used': False,
+            'fallback_failed': False,
+        }
+        
+        # Pre-compute per-video data that doesn't change per candidate
+        video_data = {}
         for vp in video_paths:
             if video_usage_count[vp] >= reuse_limit:
                 continue
-
-            candidates = all_candidates.get(vp, [])
+            # Find closest available duration for this video
+            durations = list(all_candidates.get(vp, {}).keys())
+            if not durations:
+                continue
+            closest_duration = min(durations, key=lambda d: abs(d - bucketed_duration))
+            candidates = all_candidates.get(vp, {}).get(closest_duration, [])
             if not candidates:
                 continue
-
+            
             source_duration = get_video_duration(vp)
             if source_duration <= 0:
                 continue
-
+                
             used_intervals = used_source_intervals[vp]
-            cursor = video_cursors[vp]  # Earliest allowed timestamp for this video
-
-            for cand_idx, cand in enumerate(candidates):
-                cand_time = cand["t"]
-                cand_end = cand_time + duration
-
-                if cand_end > source_duration:
-                    continue
-
-                # CHRONOLOGICAL ORDERING: only use clips at or after cursor
-                if cand_time < cursor:
-                    continue
-
-                # Check for overlap with already used intervals from this video
-                overlap = False
-                for (used_start, used_end) in used_intervals:
-                    if not (cand_end <= used_start or cand_time >= used_end):
-                        overlap = True
-                        break
-
-                if overlap:
-                    continue
-
-                # ---- Scoring components ----
-
-                # Scene bonus (0.20 max) - per SPEC weight
-                scene_bonus = 0.20 if cand.get("scene_flag", False) else 0.0
-
-                # Proximity bonus (0.10 max) - closer to beat time is better
-                proximity_bonus = max(0.0, 0.10 * (1.0 - min(1.0, abs(cand_time - beat_time) / 10.0)))
-
-                # Motion score (0.30 max) - per SPEC weight
-                motion_raw = cand.get("motion_score", 0.0)
-                motion_score = motion_raw * 0.30
-
-                # Diversity penalty (subtract up to 0.15) - per SPEC weight
-                diversity_penalty = _compute_diversity_penalty(cand_time, duration, used_intervals, source_duration) * 0.15
-
-                # Highlight bonus (0.20 max) - prefer visually interesting moments
-                highlight_bonus = 0.0
-                highlights = video_highlights.get(vp, [])
-                for hl in highlights:
-                    hl_start = hl.get("start", 0)
-                    hl_end = hl.get("end", 0)
-                    # Check if candidate overlaps with highlight
-                    if not (cand_end <= hl_start or cand_time >= hl_end):
-                        overlap_ratio = min(cand_end, hl_end) - max(cand_time, hl_start)
-                        if overlap_ratio > 0:
-                            highlight_bonus = max(highlight_bonus, 0.20 * (overlap_ratio / duration))
-                            break
-
-                # Quality bonus (0.15 max) - would need visual quality at candidate time
-                quality_bonus = 0.0
-
-                # Beat type specific adjustments
-                type_bonus = 0.0
-                if beat_type == "drop":
-                    # Drop: extra boost for high motion
-                    type_bonus = motion_raw * 0.25
-                elif beat_type == "buildup":
-                    # Buildup: prefer increasing motion (approximated by higher motion)
-                    type_bonus = motion_raw * 0.15
-                elif beat_type == "downbeat":
-                    # Downbeat: prefer scene changes
-                    type_bonus = 0.15 if cand.get("scene_flag", False) else 0.0
-
-                # Energy matching weight (music-aware)
-                energy_weight = _energy_match_weight(beat_energy, motion_raw)
-
-                # Combined score
-                base_score = scene_bonus + proximity_bonus + motion_score + highlight_bonus + quality_bonus + type_bonus - diversity_penalty
-                score = base_score * energy_weight
-
+            cursor = video_cursors[vp]
+            
+            # Extract candidate arrays for vectorized operations
+            n_cands = len(candidates)
+            if n_cands == 0:
+                continue
+                
+            cand_times = np.array([c["t"] for c in candidates], dtype=np.float64)
+            cand_ends = cand_times + duration
+            scene_flags = np.array([c.get("scene_flag", False) for c in candidates], dtype=bool)
+            motion_raw_arr = np.array([c.get("motion_score", 0.0) for c in candidates], dtype=np.float64)
+            
+            # Pre-filter: duration bounds
+            duration_mask = cand_ends <= source_duration
+            diag_duration_passed = int(np.sum(duration_mask))
+            # Pre-filter: chronological ordering
+            cursor_mask = cand_times >= cursor
+            diag_cursor_passed = int(np.sum(cursor_mask))
+            
+            # Overlap check - vectorized where possible
+            overlap_mask = np.zeros(n_cands, dtype=bool)
+            if len(used_intervals) > 0:
+                for used_start, used_end in used_intervals:
+                    # cand overlaps if NOT (cand_end <= used_start OR cand_time >= used_end)
+                    overlap_mask |= ~((cand_ends <= used_start) | (cand_times >= used_end))
+            
+            overlap_rejected = int(np.sum(overlap_mask))
+            
+            # Combined valid mask
+            valid_mask = duration_mask & cursor_mask & ~overlap_mask
+            valid_indices = np.where(valid_mask)[0]
+            n_valid = len(valid_indices)
+            
+            # Detailed overlap stats for first few beat groups
+            if beat_idx < 3:
+                print(f"       [OVERLAP DIAG] Beat {beat_idx} VP {os.path.basename(vp)}: total_cands={n_cands}, dur_pass={diag_duration_passed}, cursor_pass={diag_cursor_passed}, overlap_rej={overlap_rejected}, valid={n_valid}")
+                if len(used_intervals) > 0:
+                    print(f"         used_intervals: {[(f'{s:.1f}', f'{e:.1f}') for s,e in used_intervals]}")
+                if n_valid == 0 and overlap_rejected > 0:
+                    # Show some rejected candidates
+                    rejected_indices = np.where(overlap_mask & duration_mask & cursor_mask)[0]
+                    for ridx in rejected_indices[:3]:
+                        c = candidates[int(ridx)]
+                        print(f"         rejected candidate: t={c['t']:.2f}, end={c['t']+duration:.2f}")
+            
+            if n_valid == 0:
+                continue
+                
+            # Extract valid candidate data
+            valid_cand_times = cand_times[valid_mask]
+            valid_cand_ends = cand_ends[valid_mask]
+            valid_scene_flags = scene_flags[valid_mask]
+            valid_motion_raw = motion_raw_arr[valid_mask]
+            valid_cand_indices = valid_indices  # original indices in candidates list
+            
+            # ---- Vectorized Scoring Components ----
+            
+            # Scene bonus (0.20 max)
+            scene_bonus = np.where(valid_scene_flags, 0.20, 0.0)
+            
+            # Proximity bonus (0.10 max) - closer to beat time is better
+            proximity = np.abs(valid_cand_times - beat_time)
+            proximity_bonus = np.maximum(0.0, 0.10 * (1.0 - np.minimum(1.0, proximity / 10.0)))
+            
+            # Motion score (0.30 max)
+            motion_score = valid_motion_raw * 0.30
+            
+            # Diversity penalty (subtract up to 0.15)
+            # _compute_diversity_penalty can't be easily vectorized, compute per candidate
+            diversity_penalties = np.array([
+                _compute_diversity_penalty(valid_cand_times[i], duration, used_intervals, source_duration) * 0.15
+                for i in range(n_valid)
+            ], dtype=np.float64)
+            
+            # Highlight bonus (0.20 max)
+            highlight_bonus = np.zeros(n_valid, dtype=np.float64)
+            highlights = video_highlights.get(vp, [])
+            if highlights:
+                for i in range(n_valid):
+                    cand_time = valid_cand_times[i]
+                    cand_end = valid_cand_ends[i]
+                    best_hb = 0.0
+                    for hl in highlights:
+                        hl_start = hl.get("start", 0)
+                        hl_end = hl.get("end", 0)
+                        if not (valid_cand_ends[i] <= hl_start or cand_time >= hl_end):
+                            overlap_ratio = min(valid_cand_ends[i], hl_end) - max(cand_time, hl_start)
+                            if overlap_ratio > 0:
+                                best_hb = max(best_hb, 0.20 * (overlap_ratio / duration))
+                    highlight_bonus[i] = best_hb
+            
+            # Quality bonus
+            quality_bonus = 0.0
+            
+            # Beat type specific adjustments
+            type_bonus = np.zeros(n_valid, dtype=np.float64)
+            if beat_type == "drop":
+                type_bonus = valid_motion_raw * 0.25
+            elif beat_type == "buildup":
+                type_bonus = valid_motion_raw * 0.15
+            elif beat_type == "downbeat":
+                type_bonus = np.where(valid_scene_flags, 0.15, 0.0)
+            
+            # Energy matching weight
+            # _energy_match_weight depends on motion_raw, compute per candidate
+            energy_weights = np.array([
+                _energy_match_weight(beat_energy, valid_motion_raw[i])
+                for i in range(n_valid)
+            ], dtype=np.float64)
+            
+            # Base score (before energy weight)
+            base_score = scene_bonus + proximity_bonus + motion_score + highlight_bonus + quality_bonus + type_bonus - diversity_penalties
+            score_arr = base_score * energy_weights
+            
+            # Find best
+            best_idx_local = int(np.argmax(score_arr))
+            best_score_local = float(score_arr[best_idx_local])
+            best_cand_idx = int(valid_cand_indices[best_idx_local])
+            
+            if best_score_local > best_score:
+                best_score = best_score_local
+                best_candidate = candidates[best_cand_idx]
+                best_video = vp
+            
+            # Build beat_scores list for distribution bonuses
+            for i in range(n_valid):
+                cand_idx = int(valid_cand_indices[i])
+                cand = candidates[cand_idx]
                 beat_scores.append({
                     "video_path": vp,
                     "candidate_idx": cand_idx,
-                    "candidate_time": cand_time,
-                    "scene_flag": cand.get("scene_flag", False),
-                    "motion_score": motion_raw,
-                    "diversity_penalty": diversity_penalty,
+                    "candidate_time": float(valid_cand_times[i]),
+                    "scene_flag": bool(valid_scene_flags[i]),
+                    "motion_score": float(valid_motion_raw[i]),
+                    "diversity_penalty": float(diversity_penalties[i]),
                     "beat_energy": beat_energy,
                     "beat_strength": beat_strength,
                     "beat_type": beat_type,
-                    "energy_weight": energy_weight,
-                    "type_bonus": type_bonus,
-                    "score": score,
+                    "energy_weight": float(energy_weights[i]),
+                    "type_bonus": float(type_bonus[i]),
+                    "score": float(score_arr[i]),
                 })
+            
+            candidates_considered += n_valid
+            candidates_filtered_duration += np.sum(~duration_mask)
+            candidates_filtered_cursor += np.sum(~cursor_mask)
+            candidates_filtered_overlap += np.sum(overlap_mask & duration_mask & cursor_mask)
 
-                if score > best_score:
-                    best_score = score
-                    best_candidate = cand
-                    best_video = vp
+        score_elapsed = time.perf_counter() - score_start
+        if score_elapsed > 0.1:
+            print(f"       Beat {beat_idx}: scoring took {score_elapsed:.3f}s for {len(beat_scores)} candidates", flush=True)
+        
+        if not beat_scores:
+            debug_scores[beat_idx] = []
+            continue
 
         # Multi-video distribution bonuses: apply after initial scoring
         # This encourages using all uploaded videos across their full durations
@@ -451,23 +635,27 @@ def _greedy_assign(
             for sc in beat_scores:
                 vp = sc["video_path"]
                 
-                # Usage balance bonus: prefer videos used less than average
+                # Usage balance bonus: STRONGLY prefer videos used less than average
                 clips_used = video_usage_count[vp]
                 if avg_clips_per_video > 0:
                     usage_ratio = clips_used / avg_clips_per_video
-                    # Bonus up to 0.15 for videos underused, penalty for overused
-                    usage_bonus = max(-0.10, min(0.15, 0.15 * (1.0 - usage_ratio)))
+                    # Bonus up to 0.50 for videos underused, penalty for overused
+                    usage_bonus = max(-0.30, min(0.50, 0.50 * (1.0 - usage_ratio)))
                 else:
-                    usage_bonus = 0.15  # First round: encourage all videos
+                    usage_bonus = 0.50  # First round: strongly encourage all videos
                 
                 # Footage availability bonus: prefer videos with more unused duration
                 source_duration = get_video_duration(vp)
                 used_duration = sum(end - start for start, end in used_source_intervals[vp])
                 unused_ratio = max(0.0, (source_duration - used_duration) / source_duration)
-                # Bonus up to 0.10 for videos with lots of unused footage
-                freshness_bonus = 0.10 * unused_ratio
+                # Bonus up to 0.20 for videos with lots of unused footage
+                freshness_bonus = 0.20 * unused_ratio
                 
-                sc["distribution_bonus"] = usage_bonus + freshness_bonus
+                # Diversity penalty: penalize videos already used for this beat's energy level
+                # (simplified: just penalize heavily used videos)
+                diversity_penalty_extra = -0.10 * clips_used
+                
+                sc["distribution_bonus"] = usage_bonus + freshness_bonus + diversity_penalty_extra
                 sc["adjusted_score"] = sc["score"] + sc["distribution_bonus"]
         else:
             for sc in beat_scores:
@@ -514,7 +702,7 @@ def _greedy_assign(
             best_candidate = None
             for vp in video_paths:
                 if vp == selected["video_path"]:
-                    candidates = all_candidates.get(vp, [])
+                    candidates = all_candidates.get(vp, {}).get(bucketed_duration, [])
                     for cand in candidates:
                         if abs(cand["t"] - selected["candidate_time"]) < 0.001:
                             best_candidate = cand
@@ -525,6 +713,7 @@ def _greedy_assign(
 
         def _find_fallback_candidate(beat_idx, beat_group, duration, beat_time, beat_energy, beat_strength, beat_type):
             """Fallback: find ANY valid candidate by progressively relaxing constraints."""
+            bucketed_duration = round(duration * 20) / 20
             # Prioritize videos with fewer clips used and more unused footage
             def _video_priority(vp):
                 clips_used = video_usage_count[vp]
@@ -539,7 +728,7 @@ def _greedy_assign(
             # Phase 1: Try with relaxed reuse_limit (allow reuse of video, but not same clip intervals)
             # Respect ENFORCE_ASCENDING_ORDER
             for vp in sorted_videos:
-                candidates = all_candidates.get(vp, [])
+                candidates = all_candidates.get(vp, {}).get(bucketed_duration, [])
                 if not candidates:
                     continue
                 source_duration = get_video_duration(vp)
@@ -575,7 +764,7 @@ def _greedy_assign(
             # If False, we must find unused candidates - expand search
             if ALLOW_CLIP_REUSE:
                 for vp in sorted_videos:
-                    candidates = all_candidates.get(vp, [])
+                    candidates = all_candidates.get(vp, {}).get(bucketed_duration, [])
                     if not candidates:
                         continue
                     source_duration = get_video_duration(vp)
@@ -603,7 +792,10 @@ def _greedy_assign(
                 # Sample at finer intervals to find gaps
                 fine_interval = 0.5  # 500ms steps
                 t = cursor  # Start from cursor to respect ascending order
-                while t + duration <= source_duration:
+                max_iterations = int((source_duration - cursor) / fine_interval) + 10
+                iterations = 0
+                while t + duration <= source_duration and iterations < max_iterations:
+                    iterations += 1
                     cand_time = t
                     cand_end = cand_time + duration
                     overlap = False
@@ -622,70 +814,32 @@ def _greedy_assign(
                         if not overlap:
                             return vp, {"t": cand_time, "scene_flag": False, "motion_score": 0.0}, snapped_start, -1.5
                     t += fine_interval
-            
-            # Phase 4: Last resort - ignore overlap check but still respect ascending order
-            # Only if no candidate found respecting both overlap and order
-            for vp in sorted_videos:
-                candidates = all_candidates.get(vp, [])
-                if not candidates:
-                    continue
-                source_duration = get_video_duration(vp)
-                if source_duration <= 0:
-                    continue
-                cursor = video_cursors[vp] if ENFORCE_ASCENDING_ORDER else 0.0
-                for cand in candidates:
-                    cand_time = cand["t"]
-                    cand_end = cand_time + duration
-                    if cand_end > source_duration:
-                        continue
-                    if ENFORCE_ASCENDING_ORDER and cand_time < cursor:
-                        continue
-                    snapped_start = snap_to_frame(cand_time)
-                    return vp, cand, snapped_start, -2.0
-            
-            # Phase 5: Last resort - if ALLOW_CLIP_REUSE, use first video respecting cursor
-            if ALLOW_CLIP_REUSE:
+                
+                # Phase 4 (was Phase 6): GUARANTEED ASSIGNMENT with HARD overlap check
+                # Search from cursor onwards for a non-overlapping slot
                 for vp in sorted_videos:
                     source_duration = get_video_duration(vp)
-                    if source_duration >= duration:
-                        cursor = video_cursors[vp] if ENFORCE_ASCENDING_ORDER else 0.0
-                        cand_time = max(cursor, 0.0)
-                        if cand_time + duration <= source_duration:
+                    cursor = video_cursors[vp] if ENFORCE_ASCENDING_ORDER else 0.0
+                    search_start = cursor
+                    max_iterations = int((source_duration - cursor) / 0.5) + 10
+                    iterations = 0
+                    while search_start + duration <= source_duration and iterations < max_iterations:
+                        iterations += 1
+                        cand_time = search_start
+                        cand_end = cand_time + duration
+                        overlap = False
+                        for (used_start, used_end) in used_source_intervals[vp]:
+                            if not (cand_end <= used_start or cand_time >= used_end):
+                                overlap = True
+                                break
+                        if not overlap:
                             snapped_start = snap_to_frame(cand_time)
-                            return vp, {"t": cand_time, "scene_flag": False, "motion_score": 0.0}, snapped_start, -3.0
-                        # If cursor is too far, wrap to start of video (last resort)
-                        if not ENFORCE_ASCENDING_ORDER:
-                            snapped_start = snap_to_frame(0.0)
-                            return vp, {"t": 0.0, "scene_flag": False, "motion_score": 0.0}, snapped_start, -3.0
-            
-            # Phase 6: GUARANTEED ASSIGNMENT - ensure full music coverage while respecting ascending order
-            # This ensures timeline_duration >= music_duration by always finding a slot
-            best_vp = None
-            best_duration = 0.0
-            for vp in sorted_videos:
-                source_duration = get_video_duration(vp)
-                cursor = video_cursors[vp] if ENFORCE_ASCENDING_ORDER else 0.0
-                if source_duration >= cursor + duration:
-                    # Use cursor position to maintain ascending order
-                    cand_time = cursor
-                    snapped_start = snap_to_frame(cand_time)
-                    return vp, {"t": cand_time, "scene_flag": False, "motion_score": 0.0}, snapped_start, -10.0
-                elif source_duration >= duration and best_vp is None:
-                    # Video has enough duration but cursor is too far - use end - duration (last resort)
-                    best_vp = vp
-                    best_duration = source_duration
-                elif source_duration > best_duration:
-                    best_vp = vp
-                    best_duration = source_duration
-            
-            # If no video can accommodate at cursor, use the best video at latest possible position
-            if best_vp:
-                cursor = video_cursors[best_vp] if ENFORCE_ASCENDING_ORDER else 0.0
-                cand_time = min(cursor, max(0.0, best_duration - duration))
-                snapped_start = snap_to_frame(cand_time)
-                return best_vp, {"t": cand_time, "scene_flag": False, "motion_score": 0.0}, snapped_start, -10.0
-            
-            return None, None, None, None
+                            return vp, {"t": cand_time, "scene_flag": False, "motion_score": 0.0}, snapped_start, -5.0
+                        search_start += 0.5  # Step forward
+                
+                # If absolutely no non-overlapping slot exists in any video, return None
+                # (should not happen if total source duration >= music duration)
+                return None, None, None, None
 
         if best_candidate and best_video:
             cand_time = best_candidate["t"]
@@ -715,6 +869,7 @@ def _greedy_assign(
                 else:
                     debug_scores[beat_idx] = beat_scores
                     continue
+
             # else: use the normal best_candidate
 
             assignments.append({
@@ -763,8 +918,344 @@ def _greedy_assign(
                 debug_scores[beat_idx] = beat_scores
                 continue
 
-        debug_scores[beat_idx] = beat_scores
+        beat_elapsed = time.perf_counter() - beat_start
+        if beat_elapsed > 0.05:
+            print(f"       Beat {beat_idx}: total={beat_elapsed:.3f}s score={score_elapsed:.3f}s "
+                  f"cand_considered={candidates_considered} filtered: "
+                  f"overlap={candidates_filtered_overlap} cursor={candidates_filtered_cursor} "
+                  f"dur={candidates_filtered_duration} scored={len(beat_scores)}", flush=True)
 
+    # Final diagnostic summary
+    print(f"\n{'='*60}")
+    print(f"[DIAGNOSTIC SUMMARY] _greedy_assign")
+    print(f"{'='*60}")
+    print(f"Total beat groups: {len(beat_groups)}")
+    print(f"Assignments made: {len(assignments)}")
+    print(f"Beat groups with 0 candidates: {sum(1 for v in debug_scores.values() if len(v) == 0)}")
+    print(f"Beat groups with fallback: {sum(1 for v in debug_scores.values() if len(v) > 0 and v and any('fallback' in str(s) for s in v))}")
+    if debug_scores:
+        total_examined = sum(len(v) for v in debug_scores.values() if v)
+        total_scored = sum(1 for v in debug_scores.values() if v)
+        print(f"Total candidates scored across all beats: {total_examined}")
+        print(f"Beats with any scored candidates: {total_scored}")
+    print(f"{'='*60}\n")
+    
+    print(f"\n{'='*60}")
+    print(f"[DIAG] _greedy_assign END - returning {len(assignments)} assignments")
+    print(f"{'='*60}\n")
+    
+    return assignments, debug_scores, all_candidates
+
+
+def _hungarian_assign(
+    beat_groups: list[dict],
+    video_paths: list[str],
+    all_candidates: dict,
+    music_analysis: dict,
+    video_analyses: list,
+    reuse_limit: int,
+) -> tuple:
+    """
+    Hungarian algorithm for global optimal clip assignment.
+    
+    Builds cost matrix: beat_groups × candidates, where cost = 1 - score.
+    Invalid assignments (overlap, duration mismatch, reuse limit) get INF cost.
+    
+    Returns: (assignments, debug_scores, all_candidates)
+    """
+    print(f"\n{'='*60}")
+    print(f"[DIAG] _hungarian_assign START")
+    print(f"       beat_groups: {len(beat_groups)}")
+    print(f"       video_paths: {len(video_paths)}")
+    print(f"       reuse_limit: {reuse_limit}")
+    total_cands = sum(len(cands) for vp in video_paths for cands in all_candidates.get(vp, {}).values())
+    durations = set()
+    for vp in video_paths:
+        durations.update(all_candidates.get(vp, {}).keys())
+    print(f"       total candidates: {total_cands}")
+    print(f"       durations: {sorted(durations)}")
+    for vp in video_paths:
+        vp_cands = all_candidates.get(vp, {})
+        for dur, cands in vp_cands.items():
+            print(f"         {os.path.basename(vp)} dur={dur:.2f}s: {len(cands)} candidates")
+    print(f"{'='*60}\n")
+    
+    try:
+        from scipy.optimize import linear_sum_assignment
+    except ImportError:
+        print("       SciPy not available, falling back to greedy")
+        return _greedy_assign(beat_groups, video_paths, SCENE_THRESH, SAMPLE_INTERVAL, reuse_limit, True, None, music_analysis, video_analyses, all_candidates)
+    
+    # Fallback to greedy for large problems (cost matrix build is O(n_beats * n_cands))
+    total_cands = sum(len(cands) for vp in video_paths for cands in all_candidates.get(vp, {}).values())
+    if len(beat_groups) * total_cands > 5000:
+        print(f"       Problem too large for Hungarian ({len(beat_groups)} beats × {total_cands} cands), using greedy")
+        return _greedy_assign(beat_groups, video_paths, SCENE_THRESH, SAMPLE_INTERVAL, reuse_limit, True, None, music_analysis, video_analyses, all_candidates)
+    
+    # Flatten all candidates with metadata
+    all_cands_flat = []
+    cand_metadata = []  # (video_path, duration, candidate_dict)
+    
+    for vp in video_paths:
+        for duration, cands in all_candidates.get(vp, {}).items():
+            for c in cands:
+                all_cands_flat.append(c)
+                cand_metadata.append((vp, duration, c))
+    
+    n_beats = len(beat_groups)
+    n_cands = len(all_cands_flat)
+    
+    if n_cands == 0:
+        return [], {}, all_candidates
+    
+    # Build cost matrix: rows=beat_groups, cols=candidates
+    INF = 1e6
+    cost_matrix = np.full((n_beats, n_cands), INF)
+    
+    all_beats = music_analysis.get("beats", []) if music_analysis else []
+    drops = music_analysis.get("drops", []) if music_analysis else []
+    buildups = music_analysis.get("buildups", []) if music_analysis else []
+    video_highlights = {}
+    if video_analyses:
+        for va in video_analyses:
+            video_highlights[va.get("path")] = va.get("highlights", [])
+    
+    # Pre-compute used intervals per video (will be updated during assignment)
+    used_intervals = {vp: [] for vp in video_paths}
+    video_usage = {vp: 0 for vp in video_paths}
+    
+    # Pre-compute video durations to avoid repeated get_video_duration() calls in inner loop
+    source_durations = {vp: get_video_duration(vp) for vp in video_paths}
+    
+    # We need to score each (beat, candidate) pair
+    # This is O(n_beats * n_cands) but done once
+    
+    # Diagnostic counters for cost matrix construction
+    diag_total_checked = 0
+    diag_rejected_duration_mismatch = 0
+    diag_rejected_source_duration = 0
+    diag_rejected_cursor = 0
+    diag_rejected_reuse = 0
+    diag_rejected_overlap = 0
+    diag_scored = 0
+    
+    for beat_idx, beat_group in enumerate(beat_groups):
+        beat_time = beat_group["start"]
+        duration = beat_group["duration"]
+        bucketed_duration = round(duration * 20) / 20
+        
+        # Find corresponding beat info
+        beat_info = None
+        if all_beats:
+            beat_diffs = [(abs(b["time"] - beat_time), i) for i, b in enumerate(all_beats)]
+            if beat_diffs:
+                _, closest_idx = min(beat_diffs)
+                beat_info = all_beats[closest_idx]
+        
+        beat_energy = beat_info.get("energy", beat_info.get("strength", 0.5)) if beat_info else 0.5
+        beat_strength = beat_info.get("strength", 0.5) if beat_info else 0.5
+        beat_type = classify_beat_type(beat_info, all_beats, closest_idx if beat_info else 0, drops, buildups) if beat_info else "regular"
+        
+        beat_scored = 0
+        for cand_idx, (cand, (vp, cand_duration, _)) in enumerate(zip(all_cands_flat, cand_metadata)):
+            diag_total_checked += 1
+            # Duration must match (within bucket tolerance)
+            if abs(cand_duration - bucketed_duration) > 0.05:
+                diag_rejected_duration_mismatch += 1
+                continue
+            
+            cand_time = cand["t"]
+            cand_end = cand_time + duration
+            source_duration = source_durations[vp]
+            
+            if cand_end > source_duration:
+                diag_rejected_source_duration += 1
+                continue
+            
+            # Check chronological ordering
+            cursor = 0.0  # Simplified: no cursor for Hungarian
+            if ENFORCE_ASCENDING_ORDER and cand_time < cursor:
+                diag_rejected_cursor += 1
+                continue
+            
+            # Check reuse limit
+            if video_usage[vp] >= reuse_limit:
+                diag_rejected_reuse += 1
+                continue
+            
+            # Check overlap with already assigned intervals
+            overlap = False
+            for (used_start, used_end) in used_intervals[vp]:
+                if not (cand_end <= used_start or cand_time >= used_end):
+                    overlap = True
+                    break
+            if overlap:
+                diag_rejected_overlap += 1
+                continue
+            
+            diag_scored += 1
+            beat_scored += 1
+            
+            # Compute score (same as greedy)
+            scene_bonus = 0.20 if cand.get("scene_flag", False) else 0.0
+            proximity_bonus = max(0.0, 0.10 * (1.0 - min(1.0, abs(cand_time - beat_time) / 10.0)))
+            motion_raw = cand.get("motion_score", 0.0)
+            motion_score = motion_raw * 0.30
+            
+            # Diversity penalty
+            diversity_penalty = 0.0
+            min_dist = float('inf')
+            for (used_start, used_end) in used_intervals[vp]:
+                if cand_end <= used_start:
+                    dist = used_start - cand_end
+                elif cand_time >= used_end:
+                    dist = cand_time - used_end
+                else:
+                    dist = 0
+                min_dist = min(min_dist, dist)
+            if min_dist < 3.0 and min_dist > 0:  # MIN_CLIP_GAP
+                diversity_penalty = 1.0
+            elif min_dist <= 15.0:
+                diversity_penalty = 0.7 * (1.0 - (min_dist - 3.0) / 12.0)
+            
+            # Highlight bonus
+            highlight_bonus = 0.0
+            highlights = video_highlights.get(vp, [])
+            for hl in highlights:
+                hl_start = hl.get("start", 0)
+                hl_end = hl.get("end", 0)
+                if not (cand_end <= hl_start or cand_time >= hl_end):
+                    overlap_ratio = min(cand_end, hl_end) - max(cand_time, hl_start)
+                    if overlap_ratio > 0:
+                        highlight_bonus = max(highlight_bonus, 0.20 * (overlap_ratio / duration))
+                        break
+            
+            # Beat type bonus
+            type_bonus = 0.0
+            if beat_type == "drop":
+                type_bonus = motion_raw * 0.25
+            elif beat_type == "buildup":
+                type_bonus = motion_raw * 0.15
+            elif beat_type == "downbeat":
+                type_bonus = 0.15 if cand.get("scene_flag", False) else 0.0
+            
+            # Energy matching
+            def _energy_match_weight(beat_energy, motion_raw):
+                if beat_energy < 0.2:
+                    return 1.0 + ((1.0 - motion_raw) * 0.4)
+                elif beat_energy < 0.4:
+                    return 1.0 + ((1.0 - motion_raw) * 0.2)
+                elif beat_energy < 0.6:
+                    return 1.0
+                elif beat_energy < 0.8:
+                    return 1.0 + (motion_raw * 0.3)
+                else:
+                    return 1.0 + (motion_raw * 0.5)
+            
+            energy_weight = _energy_match_weight(beat_energy, motion_raw)
+            
+            base_score = scene_bonus + proximity_bonus + motion_score + highlight_bonus + type_bonus - diversity_penalty * 0.15
+            score = base_score * energy_weight
+            
+            # Distribution bonus
+            total_clips = sum(video_usage.values())
+            avg_clips = total_clips / len(video_paths) if total_clips > 0 else 0
+            clips_used = video_usage[vp]
+            if avg_clips > 0:
+                usage_ratio = clips_used / avg_clips
+                usage_bonus = max(-0.30, min(0.50, 0.50 * (1.0 - usage_ratio)))
+            else:
+                usage_bonus = 0.50
+            source_dur = source_durations[vp]
+            used_dur = sum(e - s for s, e in used_intervals[vp])
+            unused_ratio = max(0.0, (source_dur - used_dur) / source_dur) if source_dur > 0 else 0
+            freshness_bonus = 0.20 * unused_ratio
+            diversity_penalty_extra = -0.10 * clips_used
+            distribution_bonus = usage_bonus + freshness_bonus + diversity_penalty_extra
+            
+            adjusted_score = score + distribution_bonus
+            
+            # Cost = 1 - score (minimize cost = maximize score)
+            # Normalize score to roughly [0, 1] range for cost
+            normalized_score = max(0.0, min(1.0, (adjusted_score + 1.0) / 2.0))
+            cost_matrix[beat_idx, cand_idx] = 1.0 - normalized_score
+        
+        if beat_idx < 3 or beat_idx % 10 == 0:  # Log first 3 and every 10th
+            print(f"       [DIAG] Hungarian cost matrix beat {beat_idx}: checked={diag_total_checked - (beat_idx * n_cands) if beat_idx > 0 else diag_total_checked}, dur_mismatch={diag_rejected_duration_mismatch}, src_dur={diag_rejected_source_duration}, cursor={diag_rejected_cursor}, reuse={diag_rejected_reuse}, overlap={diag_rejected_overlap}, scored={diag_scored}, this_beat_scored={beat_scored}")
+    
+    print(f"\n[DIAG] Hungarian cost matrix SUMMARY: total_checked={diag_total_checked}, dur_mismatch={diag_rejected_duration_mismatch}, src_dur={diag_rejected_source_duration}, cursor={diag_rejected_cursor}, reuse={diag_rejected_reuse}, overlap={diag_rejected_overlap}, scored={diag_scored}")
+    print(f"       Cost matrix shape: {cost_matrix.shape}, finite entries: {np.sum(cost_matrix < 1e6)}")
+    
+    # Run Hungarian algorithm
+    row_ind, col_ind = linear_sum_assignment(cost_matrix)
+    
+    # Build assignments from matching
+    assignments = []
+    debug_scores = {}
+    
+    for beat_idx, cand_idx in zip(row_ind, col_ind):
+        if cost_matrix[beat_idx, cand_idx] >= 1e6:
+            continue  # Invalid assignment
+        
+        beat_group = beat_groups[beat_idx]
+        cand = all_cands_flat[cand_idx]
+        vp, cand_duration, _ = cand_metadata[cand_idx]
+        
+        duration = beat_group["duration"]
+        cand_time = cand["t"]
+        cand_end = cand_time + duration
+        
+        # Final overlap check
+        overlap = False
+        for (used_start, used_end) in used_intervals[vp]:
+            if not (cand_end <= used_start or cand_time >= used_end):
+                overlap = True
+                break
+        if overlap:
+            continue
+        
+        # Reuse limit check
+        if video_usage[vp] >= reuse_limit:
+            continue
+        
+        # Snap to frame
+        snapped_start = snap_to_frame(cand_time)
+        snapped_end = snapped_start + duration
+        
+        # Final snapped overlap check
+        overlap = False
+        for (used_start, used_end) in used_intervals[vp]:
+            if not (snapped_end <= used_start or snapped_start >= used_end):
+                overlap = True
+                break
+        if overlap:
+            continue
+        
+        # Compute final score for output
+        score = 1.0 - cost_matrix[beat_idx, cand_idx]
+        
+        assignments.append({
+            "beat_idx": beat_idx,
+            "video_path": vp,
+            "source_start": snapped_start,
+            "duration": duration,
+            "score": score,
+            "scene_flag": cand.get("scene_flag", False),
+            "motion_score": cand.get("motion_score", 0.0),
+            "beat_strength": beat_strength,
+            "beat_energy": beat_energy,
+            "beat_type": beat_type,
+        })
+        
+        video_usage[vp] += 1
+        used_intervals[vp].append((snapped_start, snapped_end))
+        from app.video import MIN_CLIP_GAP
+        # Note: cursor not updated in Hungarian (global optimization)
+    
+    print(f"\n{'='*60}")
+    print(f"[DIAG] _hungarian_assign END - returning {len(assignments)} assignments")
+    print(f"{'='*60}\n")
+    
     return assignments, debug_scores, all_candidates
 
 
@@ -799,28 +1290,102 @@ def ai_assign_clips(
     if not beat_groups:
         return []
 
+    # ============================================================
+    # PRE-FLIGHT CHECK: Validate total source duration vs music duration
+    # ============================================================
+    total_music_duration = sum(bg["duration"] for bg in beat_groups)
+    total_source_duration = sum(get_video_duration(vp) for vp in video_paths)
+    
+    # Calculate maximum usable source duration based on reuse policy
+    if ALLOW_CLIP_REUSE:
+        max_usable_duration = total_source_duration  # Can reuse any portion
+    else:
+        # With no reuse + MIN_CLIP_GAP, each video can contribute at most
+        # (duration - (n_clips-1)*gap) but conservatively estimate:
+        max_usable_duration = total_source_duration * 0.7  # Conservative: 70% usable due to gaps/alignment
+    
+    if max_usable_duration < total_music_duration * 0.95:  # Allow 5% tolerance
+        from app.video import MIN_CLIP_GAP
+        msg = (
+            f"Insufficient source footage: need {total_music_duration:.1f}s for music, "
+            f"but only {max_usable_duration:.1f}s usable from {len(video_paths)} videos "
+            f"(total source: {total_source_duration:.1f}s, MIN_CLIP_GAP={MIN_CLIP_GAP}s, "
+            f"ALLOW_CLIP_REUSE={ALLOW_CLIP_REUSE}). "
+        )
+        if not ALLOW_CLIP_REUSE:
+            msg += "Enable ALLOW_CLIP_REUSE=True or provide longer videos."
+        print(f"       WARNING: {msg}")
+        # Don't fail - try anyway with reuse enabled as fallback
+        # But warn user it may produce repetitive results
+    
     # Enforce no clip reuse if ALLOW_CLIP_REUSE is False
-    # With ALLOW_CLIP_REUSE=False, overlap check prevents reusing intervals
-    # So we don't need a hard limit on clips per video - just distribute across videos
     if not ALLOW_CLIP_REUSE:
-        # High limit: overlap check prevents actual clip reuse
-        # This allows multiple clips per video as long as they don't overlap
         reuse_limit = 100
     elif reuse_limit is None:
-        # Auto-calculate reuse_limit to cover full music duration
         reuse_limit = max(1, len(beat_groups) // max(1, len(video_paths)) + 1)
 
-    assignments, debug_scores, all_candidates = _greedy_assign(
-        beat_groups,
-        video_paths,
-        scene_threshold=scene_threshold,
-        sample_interval=sample_interval,
-        reuse_limit=reuse_limit,
-        compute_motion=compute_motion,
-        cache_dir=cache_dir,
-        music_analysis=music_analysis,
-        video_analyses=video_analyses,
-    )
+    # Estimate if Hungarian will be used (small problem) or greedy fallback (large)
+    # Estimate total candidates: ~10 per video per duration × num_durations
+    num_durations = len(set(round(bg["duration"] * 20) / 20 for bg in beat_groups))
+    est_total_cands = len(video_paths) * num_durations * 10
+    use_hungarian = len(beat_groups) * est_total_cands <= 5000
+
+    print(f"       [DIAG] ai_assign_clips: beat_groups={len(beat_groups)}, est_total_cands={est_total_cands}, use_hungarian={use_hungarian}")
+
+    if use_hungarian:
+        # Pre-generate candidates for Hungarian (small problem)
+        def bucket_duration(d):
+            return round(d * 20) / 20
+        
+        unique_durations = sorted(set(bucket_duration(bg["duration"]) for bg in beat_groups))
+        print(f"       Pre-generating candidates for {len(unique_durations)} unique durations (0.05s buckets): {unique_durations}")
+        
+        all_candidates = {}
+        for vp in video_paths:
+            all_candidates[vp] = {}
+            cached_scenes = None
+            if video_analyses:
+                for va in video_analyses:
+                    if va.get("path") == vp:
+                        cached_scenes = va.get("scenes", [])
+                        break
+            for duration in unique_durations:
+                candidates = generate_candidates(
+                    vp,
+                    duration,
+                    sample_interval=sample_interval,
+                    scene_threshold=scene_threshold,
+                    max_candidates=MAX_CANDIDATES_PER_SOURCE,
+                    compute_motion=compute_motion,
+                    cache_dir=cache_dir,
+                    cached_scenes=cached_scenes,
+                )
+                all_candidates[vp][duration] = candidates
+
+        assignments, debug_scores, all_candidates = _hungarian_assign(
+            beat_groups,
+            video_paths,
+            all_candidates,
+            music_analysis,
+            video_analyses,
+            reuse_limit,
+        )
+    else:
+        # Large problem: use greedy directly with pre_generated_candidates=None
+        # so it generates its own candidates internally
+        print(f"       Problem size large, using greedy assignment directly")
+        assignments, debug_scores, all_candidates = _greedy_assign(
+            beat_groups,
+            video_paths,
+            scene_threshold=scene_threshold,
+            sample_interval=sample_interval,
+            reuse_limit=reuse_limit,
+            compute_motion=compute_motion,
+            cache_dir=cache_dir,
+            music_analysis=music_analysis,
+            video_analyses=video_analyses,
+            pre_generated_candidates=None,  # Let greedy generate its own
+        )
 
     # Build result format compatible with existing sync_clips_with_beats output
     results = []
@@ -837,6 +1402,7 @@ def ai_assign_clips(
             "beat_strength": a.get("beat_strength", 0.5),
             "beat_energy": a.get("beat_energy", 0.5),
             "beat_type": a.get("beat_type", "regular"),
+            "beat_idx": a["beat_idx"],  # Add for debugging
         })
 
     return results, beat_groups, debug_scores, all_candidates

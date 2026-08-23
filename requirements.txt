@@ -6,3 +6,4 @@ numba
 streamlit
 opencv-python
 Pillow
+psutil

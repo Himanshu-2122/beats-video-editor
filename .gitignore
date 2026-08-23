@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 data/
 output/
+temp_uploads/
+*.mp4
+*.mp3

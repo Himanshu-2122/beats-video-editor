@@ -1,2 +1,6 @@
 [server]
-maxUploadSize = 5120
+maxUploadSize = 12288
+enableXsrfProtection = false
+
+[browser]
+gatherUsageStats = false

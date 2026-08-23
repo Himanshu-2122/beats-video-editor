@@ -8,6 +8,7 @@ import hashlib
 import json
 import numpy as np
 from typing import Optional
+from functools import lru_cache
 
 # ============================================================
 # VIDEO SETTINGS
@@ -133,12 +134,14 @@ def get_color_normalization_filter():
     )
 
 
-def get_video_filter():
+def get_video_filter(target_width: int = None, target_height: int = None):
     """Full filter chain for final output - applied ONCE during transition/encode stage."""
+    tw = target_width if target_width is not None else TARGET_WIDTH
+    th = target_height if target_height is not None else TARGET_HEIGHT
     return (
-        f"scale={TARGET_WIDTH}:{TARGET_HEIGHT}:"
+        f"scale={tw}:{th}:"
         f"force_original_aspect_ratio=increase,"
-        f"crop={TARGET_WIDTH}:{TARGET_HEIGHT},"
+        f"crop={tw}:{th},"
         f"setsar=1,"
         f"fps={FPS}:round=near,"
         f"{get_color_normalization_filter()},"
@@ -251,6 +254,11 @@ def generate_candidates(
 ):
     """Generate candidate clip start times from scene anchors and uniform sampling,
     distributed across the full video duration."""
+    import time
+    start_time = time.time()
+    video_name = os.path.basename(video_path)
+    print(f"       [generate_candidates] {video_name}: duration={clip_duration:.1f}s, sample_interval={sample_interval:.1f}s, max_cands={max_candidates}, motion={compute_motion}")
+    
     source_duration = get_video_duration(video_path)
     if source_duration <= clip_duration:
         return [{"t": 0.0, "scene_flag": True, "motion_score": 0.0}]
@@ -259,29 +267,32 @@ def generate_candidates(
     max_raw_candidates = 500
     if source_duration / sample_interval > max_raw_candidates:
         sample_interval = source_duration / max_raw_candidates
-        print(f"       Auto-adjusted sample_interval to {sample_interval:.1f}s for {source_duration:.0f}s video")
+        print(f"       [generate_candidates] {video_name}: Auto-adjusted sample_interval to {sample_interval:.1f}s for {source_duration:.0f}s video")
 
     candidates = []
 
     # Scene anchors (high priority) - use cached scenes if available
+    t0 = time.time()
     if cached_scenes is not None:
         scene_times = [s["start"] for s in cached_scenes if s.get("duration", 0) > 0.5]
+        print(f"       [generate_candidates] {video_name}: Using {len(scene_times)} cached scenes (took {time.time()-t0:.1f}s)")
     else:
+        print(f"       [generate_candidates] {video_name}: Detecting scenes...")
         scene_times = detect_scene_changes(video_path, scene_threshold)
+        print(f"       [generate_candidates] {video_name}: Found {len(scene_times)} scene changes (took {time.time()-t0:.1f}s)")
     for t in scene_times:
         if source_duration - t >= clip_duration:
             candidates.append({"t": t, "scene_flag": True})
 
     # Uniform sampling across full duration - vectorized for speed
+    t1 = time.time()
     max_start = source_duration - clip_duration
     if max_start > 0:
-        # Calculate number of samples directly (avoids loop)
         num_samples = int(max_start / sample_interval) + 1
         if num_samples > 0:
-            # Generate timestamps directly using list comprehension (faster than while loop)
             uniform_times = [i * sample_interval for i in range(num_samples)]
-            # Filter in comprehension (avoids second pass)
             candidates.extend({"t": t, "scene_flag": False} for t in uniform_times if t <= max_start)
+    print(f"       [generate_candidates] {video_name}: Generated {len(candidates)} raw candidates (took {time.time()-t1:.1f}s)")
 
     # Deduplicate (keep scene_flag=True if duplicate)
     seen = {}
@@ -297,12 +308,9 @@ def generate_candidates(
     uniform_candidates = [c for c in candidates if not c["scene_flag"]]
 
     # Always keep all scene anchors (they're high priority)
-    # Distribute remaining slots across uniform candidates spanning full duration
     remaining_slots = max_candidates - len(scene_candidates)
     if remaining_slots > 0 and uniform_candidates:
-        # Sort uniform candidates by time
         uniform_candidates.sort(key=lambda x: x["t"])
-        # Sample evenly across the full timeline
         if len(uniform_candidates) > remaining_slots:
             if remaining_slots == 1:
                 uniform_candidates = [uniform_candidates[len(uniform_candidates) // 2]]
@@ -310,18 +318,20 @@ def generate_candidates(
                 indices = [int(i * (len(uniform_candidates) - 1) / (remaining_slots - 1)) for i in range(remaining_slots)]
                 uniform_candidates = [uniform_candidates[i] for i in indices]
     elif remaining_slots <= 0:
-        # Too many scene anchors, keep only the first max_candidates
         scene_candidates = scene_candidates[:max_candidates]
         uniform_candidates = []
 
-    # Combine: scene anchors first (high priority), then distributed uniform candidates
     candidates = scene_candidates + uniform_candidates
     candidates.sort(key=lambda x: (not x["scene_flag"], x["t"]))
 
     # Compute motion scores if requested
     if compute_motion:
+        t_motion = time.time()
+        print(f"       [generate_candidates] {video_name}: Computing motion for {len(candidates)} candidates...")
         candidates = analyze_motion_at_candidates(video_path, candidates, clip_duration, cache_dir)
+        print(f"       [generate_candidates] {video_name}: Motion analysis done (took {time.time()-t_motion:.1f}s)")
 
+    print(f"       [generate_candidates] {video_name}: Returning {len(candidates)} candidates (total time: {time.time()-start_time:.1f}s)")
     return candidates
 
 
@@ -431,11 +441,12 @@ def analyze_motion_at_candidates(
     cache_dir: str = None,
 ) -> list[dict]:
     """
-    Compute motion scores for all candidates.
+    Compute motion scores for all candidates in parallel using ProcessPoolExecutor.
     Adds 'motion_score' to each candidate dict.
     """
     import os
     import json
+    from concurrent.futures import ProcessPoolExecutor, as_completed
 
     # Check cache first
     video_hash = get_video_hash(video_path)
@@ -446,7 +457,6 @@ def analyze_motion_at_candidates(
         try:
             with open(cache_path, 'r') as f:
                 cached = json.load(f)
-            # Merge cached scores
             cached_dict = {c['t']: c['motion_score'] for c in cached}
             for c in candidates:
                 c['motion_score'] = cached_dict.get(round(c['t'], 3), 0.0)
@@ -454,13 +464,36 @@ def analyze_motion_at_candidates(
         except Exception:
             pass
 
-    # Compute motion for each candidate
-    for c in candidates:
-        score = analyze_motion_segment(video_path, c['t'], clip_duration)
-        c['motion_score'] = score
+    if not candidates:
+        return candidates
+
+    # Prepare arguments for parallel processing
+    tasks = [(video_path, c['t'], clip_duration) for c in candidates]
+    
+    # Use ProcessPoolExecutor for CPU-bound optical flow computation
+    # Limit workers to avoid memory issues (each process loads video frames)
+    max_workers = min(len(candidates), os.cpu_count() or 4)
+    
+    print(f"       [analyze_motion_at_candidates] Computing motion for {len(candidates)} candidates with {max_workers} workers...")
+    
+    motion_results = {}
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_analyze_motion_segment_worker, task): i for i, task in enumerate(tasks)}
+        for future in as_completed(futures):
+            idx = futures[future]
+            try:
+                score = future.result()
+                motion_results[idx] = score
+            except Exception as e:
+                print(f"       [motion] Worker error for candidate {idx}: {e}")
+                motion_results[idx] = 0.0
+
+    # Apply results to candidates
+    for idx, c in enumerate(candidates):
+        c['motion_score'] = motion_results.get(idx, 0.0)
 
     # Save to cache
-    if cache_path:
+    if cache_dir:
         try:
             os.makedirs(cache_dir, exist_ok=True)
             serializable = [{'t': c['t'], 'motion_score': c['motion_score']} for c in candidates]
@@ -470,6 +503,12 @@ def analyze_motion_at_candidates(
             pass
 
     return candidates
+
+
+def _analyze_motion_segment_worker(args):
+    """Worker function for ProcessPoolExecutor - must be top-level for pickling."""
+    video_path, start_time, clip_duration = args
+    return analyze_motion_segment(video_path, start_time, clip_duration)
 
 
 # ============================================================
@@ -751,6 +790,7 @@ def natural_sort_key(path):
     ]
 
 
+@lru_cache(maxsize=128)
 def get_video_duration(video_path):
     command = [
         "ffprobe",
@@ -784,6 +824,18 @@ def get_video_duration(video_path):
 def get_clip_trim_filter():
     """Minimal filter for clip trimming - only fps/SAR normalization, no quality loss."""
     return (
+        f"fps={FPS}:round=near,"
+        f"setsar=1"
+    )
+
+
+def get_clip_normalize_filter(target_width: int = None, target_height: int = None):
+    """Full normalization filter: scale to target resolution preserving aspect ratio, pad to exact size, normalize fps/SAR."""
+    tw = target_width if target_width is not None else TARGET_WIDTH
+    th = target_height if target_height is not None else TARGET_HEIGHT
+    return (
+        f"scale={tw}:{th}:force_original_aspect_ratio=decrease,"
+        f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2,"
         f"fps={FPS}:round=near,"
         f"setsar=1"
     )
@@ -837,12 +889,16 @@ def get_cpu_video_args():
     ]
 
 
-def process_clip(video_path, duration, output_path, start_time=None, snap_frame: bool = True):
+def process_clip(video_path, duration, output_path, start_time=None, snap_frame: bool = True, target_width: int = None, target_height: int = None):
     """
-    Trim clip with stream copy (no re-encode) when possible.
-    Only applies minimal fps/SAR normalization filter.
-    Full quality processing happens once during transition stage.
+    Trim clip with normalization to target resolution/fps.
+    For clips matching target resolution: uses minimal filter (fps+setsar) with QSV for speed.
+    For clips needing normalization: applies scale+pad+fps normalization.
     """
+    # Use provided target resolution or fall back to global defaults
+    tw = target_width if target_width is not None else TARGET_WIDTH
+    th = target_height if target_height is not None else TARGET_HEIGHT
+    
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video not found: {video_path}")
 
@@ -856,6 +912,13 @@ def process_clip(video_path, duration, output_path, start_time=None, snap_frame:
     source_duration = get_video_duration(video_path)
     if source_duration <= 0:
         raise RuntimeError(f"Invalid source duration: {video_path}")
+
+    # Get source video info for normalization logging
+    src_info = get_video_info(video_path)
+    src_width = src_info.get('width', 1920)
+    src_height = src_info.get('height', 1080)
+    src_fps = src_info.get('fps', 30)
+    needs_normalize = (src_width != tw or src_height != th or abs(src_fps - FPS) > 0.1)
 
     if start_time is None:
         if source_duration > duration:
@@ -879,10 +942,20 @@ def process_clip(video_path, duration, output_path, start_time=None, snap_frame:
         start_time = snap_to_frame(start_time)
 
     print(f"[diagnostic] process_clip: start={start_time:.3f}s duration={duration:.3f}s source_duration={source_duration:.3f}s")
+    if needs_normalize:
+        print(f"[normalize] {os.path.basename(video_path)}: {src_width}x{src_height}@{src_fps:.2f}fps -> {tw}x{th}@{FPS}fps")
+    else:
+        print(f"[fast-encode] {os.path.basename(video_path)}: already {tw}x{th}@{FPS}fps, using minimal filter (fps+setsar) with QSV")
 
-    # Try stream copy first (fastest, no quality loss)
-    # Use -avoid_negative_ts make_zero to fix timestamp issues
-    copy_command = [
+    # Choose filter based on whether normalization is needed
+    if needs_normalize:
+        # Full normalization: scale+pad+fps
+        video_filter = get_clip_normalize_filter(tw, th)
+    else:
+        # Minimal filter for already-matching clips: just fps+setsar (fast with QSV)
+        video_filter = get_clip_trim_filter()
+
+    qsv_command = [
         "ffmpeg",
         "-y",
         "-ss",
@@ -891,34 +964,26 @@ def process_clip(video_path, duration, output_path, start_time=None, snap_frame:
         video_path,
         "-t",
         f"{duration:.3f}",
-        "-c:v",
-        "copy",
+        "-vf",
+        video_filter,
         "-an",
-        "-avoid_negative_ts",
-        "make_zero",
-        "-fflags",
-        "+genpts",
-        output_path,
     ]
+    qsv_command.extend(get_qsv_video_args())
+    qsv_command.extend([
+        "-movflags",
+        "+faststart",
+        output_path,
+    ])
 
     try:
-        run_ffmpeg(copy_command)
-        # Verify output duration matches expected
-        out_dur = get_video_duration(output_path)
-        if abs(out_dur - duration) > 0.1:  # Allow small tolerance
-            raise RuntimeError(f"Stream copy duration mismatch: expected {duration:.3f}s, got {out_dur:.3f}s")
-        return output_path
+        run_ffmpeg(qsv_command)
     except RuntimeError:
-        # Fallback: minimal re-encode with fps/SAR normalization only
         if os.path.exists(output_path):
             try:
                 os.remove(output_path)
             except OSError:
                 pass
-
-        video_filter = get_clip_trim_filter()
-
-        qsv_command = [
+        cpu_command = [
             "ffmpeg",
             "-y",
             "-ss",
@@ -931,44 +996,88 @@ def process_clip(video_path, duration, output_path, start_time=None, snap_frame:
             video_filter,
             "-an",
         ]
-        qsv_command.extend(get_qsv_video_args())
-        qsv_command.extend([
+        cpu_command.extend(get_cpu_video_args())
+        cpu_command.extend([
             "-movflags",
             "+faststart",
             output_path,
         ])
-
-        try:
-            run_ffmpeg(qsv_command)
-        except RuntimeError:
-            if os.path.exists(output_path):
-                try:
-                    os.remove(output_path)
-                except OSError:
-                    pass
-            cpu_command = [
-                "ffmpeg",
-                "-y",
-                "-ss",
-                f"{start_time:.3f}",
-                "-i",
-                video_path,
-                "-t",
-                f"{duration:.3f}",
-                "-vf",
-                video_filter,
-                "-an",
-            ]
-            cpu_command.extend(get_cpu_video_args())
-            cpu_command.extend([
-                "-movflags",
-                "+faststart",
-                output_path,
-            ])
-            run_ffmpeg(cpu_command)
+        run_ffmpeg(cpu_command)
 
     if not os.path.exists(output_path):
         raise RuntimeError(f"Clip was not created: {output_path}")
+
+    # Verify output
+    out_dur = get_video_duration(output_path)
+    if abs(out_dur - duration) > 0.1:
+        raise RuntimeError(f"Duration mismatch: expected {duration:.3f}s, got {out_dur:.3f}s")
+
+    out_info = get_video_info(output_path)
+    if out_info.get('width') != tw or out_info.get('height') != th:
+        raise RuntimeError(f"Normalization failed: output {out_info.get('width')}x{out_info.get('height')}, expected {tw}x{th}")
+
+    return output_path
+
+    qsv_command = [
+        "ffmpeg",
+        "-y",
+        "-ss",
+        f"{start_time:.3f}",
+        "-i",
+        video_path,
+        "-t",
+        f"{duration:.3f}",
+        "-vf",
+        video_filter,
+        "-an",
+    ]
+    qsv_command.extend(get_qsv_video_args())
+    qsv_command.extend([
+        "-movflags",
+        "+faststart",
+        output_path,
+    ])
+
+    try:
+        run_ffmpeg(qsv_command)
+    except RuntimeError:
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+        cpu_command = [
+            "ffmpeg",
+            "-y",
+            "-ss",
+            f"{start_time:.3f}",
+            "-i",
+            video_path,
+            "-t",
+            f"{duration:.3f}",
+            "-vf",
+            video_filter,
+            "-an",
+        ]
+        cpu_command.extend(get_cpu_video_args())
+        cpu_command.extend([
+            "-movflags",
+            "+faststart",
+            output_path,
+        ])
+        run_ffmpeg(cpu_command)
+
+    if not os.path.exists(output_path):
+        raise RuntimeError(f"Clip was not created: {output_path}")
+
+    # Verify output
+    out_dur = get_video_duration(output_path)
+    if abs(out_dur - duration) > 0.1:
+        raise RuntimeError(f"Duration mismatch: expected {duration:.3f}s, got {out_dur:.3f}s")
+
+    out_info = get_video_info(output_path)
+    if out_info.get('width') != tw or out_info.get('height') != th:
+        raise RuntimeError(f"Normalization failed: output {out_info.get('width')}x{out_info.get('height')}, expected {tw}x{th}")
 
     return output_path
 
@@ -1042,7 +1151,7 @@ def create_random_groups(clip_paths):
     return groups
 
 
-def create_transition_video(group_paths, output_path, logger=None, progress_callback=None):
+def create_transition_video(group_paths, output_path, logger=None, progress_callback=None, target_width: int = None, target_height: int = None):
     """
     Apply transitions AND full video processing (scale, crop, color norm, fps) in ONE pass.
     Uses hardware encoder (QSV) when available.
@@ -1052,7 +1161,7 @@ def create_transition_video(group_paths, output_path, logger=None, progress_call
 
     if len(group_paths) == 1:
         # Single group: apply full filter chain without transitions
-        return apply_full_filter_chain(group_paths[0], output_path, logger=logger)
+        return apply_full_filter_chain(group_paths[0], output_path, logger=logger, target_width=target_width, target_height=target_height)
 
     print("\nAdding selective transitions...")
 
@@ -1102,7 +1211,7 @@ def create_transition_video(group_paths, output_path, logger=None, progress_call
         previous_label = output_label
 
     # Append full video filter chain to the final output
-    final_filter = f"{previous_label}{get_video_filter()}[outv]"
+    final_filter = f"{previous_label}{get_video_filter(target_width, target_height)}[outv]"
     filters.append(final_filter)
 
     filter_complex = ";".join(filters)
@@ -1136,7 +1245,7 @@ def create_transition_video(group_paths, output_path, logger=None, progress_call
     return output_path
 
 
-def apply_full_filter_chain(input_path, output_path, logger=None):
+def apply_full_filter_chain(input_path, output_path, logger=None, target_width: int = None, target_height: int = None):
     """Apply full video filter chain (scale, crop, color, fps) to a single video."""
     command = [
         "ffmpeg",
@@ -1144,7 +1253,7 @@ def apply_full_filter_chain(input_path, output_path, logger=None):
         "-i",
         input_path,
         "-vf",
-        get_video_filter(),
+        get_video_filter(target_width, target_height),
         "-an",
     ]
 
@@ -1177,6 +1286,8 @@ def concatenate_videos(
     transition_duration=None,
     logger=None,
     progress_callback=None,
+    target_width: int = None,
+    target_height: int = None,
 ):
     """
     Concatenate clips into `output_path`.
@@ -1242,11 +1353,11 @@ def concatenate_videos(
             old_duration = globals().get("TRANSITION_DURATION", TRANSITION_DURATION)
             try:
                 globals()["TRANSITION_DURATION"] = float(transition_duration)
-                create_transition_video(group_paths, output_path, logger=logger, progress_callback=progress_callback)
+                create_transition_video(group_paths, output_path, logger=logger, progress_callback=progress_callback, target_width=target_width, target_height=target_height)
             finally:
                 globals()["TRANSITION_DURATION"] = old_duration
         else:
-            create_transition_video(group_paths, output_path, logger=logger, progress_callback=progress_callback)
+            create_transition_video(group_paths, output_path, logger=logger, progress_callback=progress_callback, target_width=target_width, target_height=target_height)
     finally:
         for path in group_paths:
             try:
@@ -1451,6 +1562,7 @@ def analyze_video_full(video_path: str, cache_dir: str = None, fast_mode: bool =
         }
 
 
+@lru_cache(maxsize=128)
 def get_video_info(video_path: str) -> dict:
     """Get video metadata using ffprobe."""
     command = [
