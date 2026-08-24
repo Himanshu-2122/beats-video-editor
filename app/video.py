@@ -107,6 +107,9 @@ TRANSITIONS = [
 # Minimum gap between clips from same source (seconds) - prevents rapid reuse feel
 MIN_CLIP_GAP = 3.0
 
+# Default seconds to skip from start of each source video (intro/sponsor/bumper)
+INTRO_SKIP_SECONDS = 30.0
+
 VIDEO_EXTENSIONS = (
     ".mp4",
     ".webm",
@@ -251,17 +254,28 @@ def generate_candidates(
     compute_motion: bool = False,
     cache_dir: str = None,
     cached_scenes: list = None,  # Accept pre-computed scenes
+    intro_skip_seconds: float = INTRO_SKIP_SECONDS,
 ):
     """Generate candidate clip start times from scene anchors and uniform sampling,
-    distributed across the full video duration."""
+    distributed across the full video duration, skipping intro region."""
     import time
+    from app.logging_system import get_logger
+    logger = get_logger()
+    
     start_time = time.time()
     video_name = os.path.basename(video_path)
-    print(f"       [generate_candidates] {video_name}: duration={clip_duration:.1f}s, sample_interval={sample_interval:.1f}s, max_cands={max_candidates}, motion={compute_motion}")
+    print(f"       [generate_candidates] {video_name}: duration={clip_duration:.1f}s, sample_interval={sample_interval:.1f}s, max_cands={max_candidates}, motion={compute_motion}, intro_skip={intro_skip_seconds:.1f}s")
     
     source_duration = get_video_duration(video_path)
     if source_duration <= clip_duration:
         return [{"t": 0.0, "scene_flag": True, "motion_score": 0.0}]
+
+    # Compute valid_start based on intro_skip_seconds
+    if intro_skip_seconds < source_duration:
+        valid_start = intro_skip_seconds
+    else:
+        valid_start = 0.0
+        logger.app_warning(f"Video {video_name} shorter than intro_skip_seconds ({source_duration:.1f}s < {intro_skip_seconds:.1f}s), falling back to valid_start=0.0")
 
     # Auto-adjust sample interval for long videos to limit raw candidate count
     max_raw_candidates = 500
@@ -281,16 +295,16 @@ def generate_candidates(
         scene_times = detect_scene_changes(video_path, scene_threshold)
         print(f"       [generate_candidates] {video_name}: Found {len(scene_times)} scene changes (took {time.time()-t0:.1f}s)")
     for t in scene_times:
-        if source_duration - t >= clip_duration:
+        if t >= valid_start and source_duration - t >= clip_duration:
             candidates.append({"t": t, "scene_flag": True})
 
     # Uniform sampling across full duration - vectorized for speed
     t1 = time.time()
     max_start = source_duration - clip_duration
-    if max_start > 0:
-        num_samples = int(max_start / sample_interval) + 1
+    if max_start > valid_start:
+        num_samples = int((max_start - valid_start) / sample_interval) + 1
         if num_samples > 0:
-            uniform_times = [i * sample_interval for i in range(num_samples)]
+            uniform_times = [valid_start + i * sample_interval for i in range(num_samples)]
             candidates.extend({"t": t, "scene_flag": False} for t in uniform_times if t <= max_start)
     print(f"       [generate_candidates] {video_name}: Generated {len(candidates)} raw candidates (took {time.time()-t1:.1f}s)")
 
@@ -331,6 +345,7 @@ def generate_candidates(
         candidates = analyze_motion_at_candidates(video_path, candidates, clip_duration, cache_dir)
         print(f"       [generate_candidates] {video_name}: Motion analysis done (took {time.time()-t_motion:.1f}s)")
 
+    logger.app_info(f"Candidates generated: video={video_name}, video_duration={source_duration:.1f}s, intro_skip={intro_skip_seconds:.1f}s, valid_start={valid_start:.1f}s, candidates={len(candidates)}")
     print(f"       [generate_candidates] {video_name}: Returning {len(candidates)} candidates (total time: {time.time()-start_time:.1f}s)")
     return candidates
 
@@ -1457,7 +1472,7 @@ def add_audio(video_path, audio_path, output_path):
 # ADVANCED VIDEO ANALYSIS (Stage 2)
 # ============================================================
 
-def analyze_video_full(video_path: str, cache_dir: str = None, fast_mode: bool = True) -> dict:
+def analyze_video_full(video_path: str, cache_dir: str = None, fast_mode: bool = True, intro_skip_seconds: float = INTRO_SKIP_SECONDS) -> dict:
     """
     Comprehensive video analysis: scenes, motion profile, highlights, 
     camera changes, visual quality.
@@ -1466,23 +1481,25 @@ def analyze_video_full(video_path: str, cache_dir: str = None, fast_mode: bool =
         video_path: Path to video file
         cache_dir: Optional cache directory
         fast_mode: If True, skip heavy computations (motion profile, camera changes, quality, colors)
+        intro_skip_seconds: Seconds to skip from start of video for analysis
     
     Returns:
         dict: Complete video analysis
     """
     if cache_dir:
         video_hash = get_video_hash(video_path)
-        cache_path = os.path.join(cache_dir, f"video_{video_hash}.json")
+        # Include intro_skip_seconds in cache key to invalidate cache when it changes
+        cache_path = os.path.join(cache_dir, f"video_{video_hash}_skip{int(intro_skip_seconds)}.json")
         if os.path.exists(cache_path):
             try:
                 with open(cache_path, 'r') as f:
                     cached = json.load(f)
-                print(f"       Loaded video analysis from cache: {os.path.basename(video_path)}")
+                print(f"       Loaded video analysis from cache: {os.path.basename(video_path)} (skip={intro_skip_seconds:.1f}s)")
                 return cached
             except Exception:
                 pass
     
-    print(f"       Analyzing video: {os.path.basename(video_path)}")
+    print(f"       Analyzing video: {os.path.basename(video_path)} (intro_skip={intro_skip_seconds:.1f}s)")
     
     try:
         duration = get_video_duration(video_path)
@@ -1493,8 +1510,8 @@ def analyze_video_full(video_path: str, cache_dir: str = None, fast_mode: bool =
         height = info.get('height', 1080)
         fps = info.get('fps', 30)
         
-        # Scene detection (fast, uses ffmpeg)
-        scenes = detect_scenes_detailed(video_path)
+        # Scene detection (fast, uses ffmpeg) - skip intro region
+        scenes = detect_scenes_detailed(video_path, intro_skip_seconds=intro_skip_seconds)
         
         if fast_mode:
             # FAST MODE: Skip heavy computations
@@ -1504,20 +1521,20 @@ def analyze_video_full(video_path: str, cache_dir: str = None, fast_mode: bool =
             quality_profile = []
             dominant_colors = []
         else:
-            # Motion profile (sampled) - SLOW
-            motion_profile = analyze_motion_profile(video_path)
+            # Motion profile (sampled) - SLOW - skip intro region
+            motion_profile = analyze_motion_profile(video_path, intro_skip_seconds=intro_skip_seconds)
             
             # Highlights detection
             highlights = detect_highlights(video_path, scenes, motion_profile)
             
-            # Camera changes - SLOW
-            camera_changes = detect_camera_changes(video_path)
+            # Camera changes - SLOW - skip intro region
+            camera_changes = detect_camera_changes(video_path, intro_skip_seconds=intro_skip_seconds)
             
-            # Visual quality profile - SLOW
-            quality_profile = analyze_visual_quality_profile(video_path)
+            # Visual quality profile - SLOW - skip intro region
+            quality_profile = analyze_visual_quality_profile(video_path, intro_skip_seconds=intro_skip_seconds)
             
-            # Dominant colors - SLOW
-            dominant_colors = analyze_dominant_colors(video_path)
+            # Dominant colors - SLOW - skip intro region
+            dominant_colors = analyze_dominant_colors(video_path, intro_skip_seconds=intro_skip_seconds)
         
         result = {
             "path": video_path,
@@ -1608,8 +1625,8 @@ def get_video_info(video_path: str) -> dict:
         return {"width": 1920, "height": 1080, "fps": 30}
 
 
-def detect_scenes_detailed(video_path: str, threshold: float = SCENE_THRESH) -> list:
-    """Detect scene changes with detailed info."""
+def detect_scenes_detailed(video_path: str, threshold: float = SCENE_THRESH, intro_skip_seconds: float = 0.0) -> list:
+    """Detect scene changes with detailed info, skipping intro region."""
     command = [
         "ffmpeg",
         "-i", video_path,
@@ -1635,13 +1652,14 @@ def detect_scenes_detailed(video_path: str, threshold: float = SCENE_THRESH) -> 
             try:
                 pts_part = line.split("pts_time:")[1].split()[0]
                 scene_time = float(pts_part)
-                scene_times.append(scene_time)
+                if scene_time >= intro_skip_seconds:
+                    scene_times.append(scene_time)
             except (IndexError, ValueError):
                 continue
     
     # Build scene segments
     scenes = []
-    all_times = [0.0] + scene_times
+    all_times = [intro_skip_seconds] + scene_times
     duration = get_video_duration(video_path)
     all_times.append(duration)
     
@@ -1660,20 +1678,21 @@ def detect_scenes_detailed(video_path: str, threshold: float = SCENE_THRESH) -> 
     return scenes
 
 
-def analyze_motion_profile(video_path: str, sample_fps: int = MOTION_SAMPLE_FPS) -> list:
-    """Analyze motion throughout the video at regular intervals."""
+def analyze_motion_profile(video_path: str, sample_fps: int = MOTION_SAMPLE_FPS, intro_skip_seconds: float = 0.0) -> list:
+    """Analyze motion throughout the video at regular intervals, skipping intro region."""
     duration = get_video_duration(video_path)
-    if duration <= 0:
+    if duration <= intro_skip_seconds:
         return []
     
     frame_interval = 1.0 / sample_fps
-    num_samples = int(duration * sample_fps)
+    # Start from intro_skip_seconds
+    num_samples = int((duration - intro_skip_seconds) * sample_fps)
     
     motion_profile = []
     prev_frame = None
     
     for i in range(num_samples + 1):
-        t = i * frame_interval
+        t = intro_skip_seconds + i * frame_interval
         if t > duration:
             break
         
@@ -1748,20 +1767,20 @@ def detect_highlights(video_path: str, scenes: list, motion_profile: list) -> li
     return merged[:50]  # Cap at 50 highlights
 
 
-def detect_camera_changes(video_path: str, sample_fps: float = 1.0) -> list:
-    """Detect camera angle changes using color histogram differences."""
+def detect_camera_changes(video_path: str, sample_fps: float = 1.0, intro_skip_seconds: float = 0.0) -> list:
+    """Detect camera angle changes using color histogram differences, skipping intro region."""
     duration = get_video_duration(video_path)
-    if duration <= 0:
+    if duration <= intro_skip_seconds:
         return []
     
     frame_interval = 1.0 / sample_fps
-    num_samples = int(duration * sample_fps)
+    num_samples = int((duration - intro_skip_seconds) * sample_fps)
     
     camera_changes = []
     prev_hist = None
     
     for i in range(num_samples + 1):
-        t = i * frame_interval
+        t = intro_skip_seconds + i * frame_interval
         if t > duration:
             break
         
@@ -1788,19 +1807,19 @@ def detect_camera_changes(video_path: str, sample_fps: float = 1.0) -> list:
     return camera_changes
 
 
-def analyze_visual_quality_profile(video_path: str, sample_fps: float = 0.5) -> list:
-    """Analyze visual quality (sharpness, brightness, contrast) over time."""
+def analyze_visual_quality_profile(video_path: str, sample_fps: float = 0.5, intro_skip_seconds: float = 0.0) -> list:
+    """Analyze visual quality (sharpness, brightness, contrast) over time, skipping intro region."""
     duration = get_video_duration(video_path)
-    if duration <= 0:
+    if duration <= intro_skip_seconds:
         return []
     
     frame_interval = 1.0 / sample_fps
-    num_samples = int(duration * sample_fps)
+    num_samples = int((duration - intro_skip_seconds) * sample_fps)
     
     quality_profile = []
     
     for i in range(num_samples + 1):
-        t = i * frame_interval
+        t = intro_skip_seconds + i * frame_interval
         if t > duration:
             break
         
@@ -1847,19 +1866,19 @@ def get_visual_quality_at_time(video_path: str, time_s: float) -> tuple:
     return (sharpness, brightness, contrast)
 
 
-def analyze_dominant_colors(video_path: str, sample_fps: float = 0.5) -> list:
-    """Analyze dominant colors throughout the video at regular intervals."""
+def analyze_dominant_colors(video_path: str, sample_fps: float = 0.5, intro_skip_seconds: float = 0.0) -> list:
+    """Analyze dominant colors throughout the video at regular intervals, skipping intro region."""
     duration = get_video_duration(video_path)
-    if duration <= 0:
+    if duration <= intro_skip_seconds:
         return []
     
     frame_interval = 1.0 / sample_fps
-    num_samples = int(duration * sample_fps)
+    num_samples = int((duration - intro_skip_seconds) * sample_fps)
     
     color_profile = []
     
     for i in range(num_samples + 1):
-        t = i * frame_interval
+        t = intro_skip_seconds + i * frame_interval
         if t > duration:
             break
         

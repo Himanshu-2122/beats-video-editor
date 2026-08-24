@@ -1,0 +1,65 @@
+2026-08-24 16:54:29 | WARNING  | app | Video test_short.mp4 shorter than intro_skip_seconds (5.0s < 30.0s), falling back to valid_start=0.0
+2026-08-24 16:54:29 | INFO     | app | Candidates generated: video=test_short.mp4, video_duration=5.0s, intro_skip=30.0s, valid_start=0.0s, candidates=7
+2026-08-24 16:55:45 | INFO     | app | Candidates generated: video=test_long.mp4, video_duration=60.0s, intro_skip=30.0s, valid_start=30.0s, candidates=53
+2026-08-24 16:55:45 | INFO     | app | Candidates generated: video=test_long.mp4, video_duration=60.0s, intro_skip=0.0s, valid_start=0.0s, candidates=100
+2026-08-24 17:09:22 | INFO     | app | Candidates generated: video=test_e2e_v1.mp4, video_duration=60.0s, intro_skip=30.0s, valid_start=30.0s, candidates=53
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=tori_vixen.mp4, video_duration=2070.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=tori_vixen.mp4, video_duration=2070.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=tori_vixen.mp4, video_duration=2070.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=tori_vixen.mp4, video_duration=2070.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=tori_vixen.mp4, video_duration=2070.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=tori_vixen.mp4, video_duration=2070.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=tori_vixen.mp4, video_duration=2070.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=tori_vixen.mp4, video_duration=2070.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=tori_vixen.mp4, video_duration=2070.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=tori_vixen.mp4, video_duration=2070.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=tori_vixen.mp4, video_duration=2070.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=tori_vixen.mp4, video_duration=2070.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=Hazel-Moore.mp4, video_duration=2963.6s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=Hazel-Moore.mp4, video_duration=2963.6s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=Hazel-Moore.mp4, video_duration=2963.6s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=Hazel-Moore.mp4, video_duration=2963.6s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=Hazel-Moore.mp4, video_duration=2963.6s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=Hazel-Moore.mp4, video_duration=2963.6s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=Hazel-Moore.mp4, video_duration=2963.6s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=Hazel-Moore.mp4, video_duration=2963.6s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=Hazel-Moore.mp4, video_duration=2963.6s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=Hazel-Moore.mp4, video_duration=2963.6s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=Hazel-Moore.mp4, video_duration=2963.6s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=Hazel-Moore.mp4, video_duration=2963.6s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=Vanessa-Sky-tushy.mp4, video_duration=2656.3s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=Vanessa-Sky-tushy.mp4, video_duration=2656.3s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=Vanessa-Sky-tushy.mp4, video_duration=2656.3s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=Vanessa-Sky-tushy.mp4, video_duration=2656.3s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=Vanessa-Sky-tushy.mp4, video_duration=2656.3s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=Vanessa-Sky-tushy.mp4, video_duration=2656.3s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=Vanessa-Sky-tushy.mp4, video_duration=2656.3s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=Vanessa-Sky-tushy.mp4, video_duration=2656.3s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=Vanessa-Sky-tushy.mp4, video_duration=2656.3s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=Vanessa-Sky-tushy.mp4, video_duration=2656.3s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=Vanessa-Sky-tushy.mp4, video_duration=2656.3s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=Vanessa-Sky-tushy.mp4, video_duration=2656.3s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=1080.mp4, video_duration=2885.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=1080.mp4, video_duration=2885.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=1080.mp4, video_duration=2885.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=1080.mp4, video_duration=2885.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=1080.mp4, video_duration=2885.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=1080.mp4, video_duration=2885.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=1080.mp4, video_duration=2885.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=1080.mp4, video_duration=2885.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=1080.mp4, video_duration=2885.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=1080.mp4, video_duration=2885.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=1080.mp4, video_duration=2885.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=1080.mp4, video_duration=2885.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=1080 (9).mp4, video_duration=2742.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=1080 (9).mp4, video_duration=2742.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=1080 (9).mp4, video_duration=2742.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=1080 (9).mp4, video_duration=2742.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=1080 (9).mp4, video_duration=2742.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=1080 (9).mp4, video_duration=2742.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=1080 (9).mp4, video_duration=2742.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=1080 (9).mp4, video_duration=2742.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=1080 (9).mp4, video_duration=2742.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=1080 (9).mp4, video_duration=2742.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=1080 (9).mp4, video_duration=2742.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100
+2026-08-24 17:25:21 | INFO     | app | Candidates generated: video=1080 (9).mp4, video_duration=2742.7s, intro_skip=30.0s, valid_start=30.0s, candidates=100

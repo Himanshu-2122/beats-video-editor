@@ -19,6 +19,7 @@ from app.video import (
     SAMPLE_INTERVAL,
     MAX_CANDIDATES_PER_SOURCE,
     MIN_CLIP_GAP,
+    INTRO_SKIP_SECONDS,
 )
 
 # ============================================================
@@ -263,6 +264,7 @@ def _greedy_assign(
     music_analysis: dict = None,
     video_analyses: list = None,  # Pre-computed video analyses for cached scenes
     pre_generated_candidates: dict = None,  # Pre-generated candidates from caller
+    intro_skip_seconds: float = INTRO_SKIP_SECONDS,
 ) -> list[dict]:
     """
     Greedy assignment of clips to beats using:
@@ -279,6 +281,7 @@ def _greedy_assign(
     print(f"       video_paths: {len(video_paths)}")
     print(f"       reuse_limit: {reuse_limit}")
     print(f"       compute_motion: {compute_motion}")
+    print(f"       intro_skip_seconds: {intro_skip_seconds:.1f}")
     print(f"       pre_generated_candidates provided: {pre_generated_candidates is not None}")
     if pre_generated_candidates:
         total_cands = sum(len(cands) for vp in video_paths for cands in pre_generated_candidates.get(vp, {}).values())
@@ -309,7 +312,8 @@ def _greedy_assign(
             video_highlights[va.get("path")] = va.get("highlights", [])
 
     # Track the earliest allowed timestamp per video for chronological ordering
-    video_cursors = {vp: 0.0 for vp in video_paths}
+    # Start cursor at intro_skip_seconds to enforce ascending order from valid region
+    video_cursors = {vp: intro_skip_seconds for vp in video_paths}
     
     # Use pre-generated candidates if provided, otherwise generate them
     if pre_generated_candidates is not None:
@@ -352,6 +356,7 @@ def _greedy_assign(
                     compute_motion=compute_motion,
                     cache_dir=cache_dir,
                     cached_scenes=cached_scenes,
+                    intro_skip_seconds=intro_skip_seconds,
                 )
                 all_candidates[vp][duration] = candidates
     
@@ -954,6 +959,7 @@ def _hungarian_assign(
     music_analysis: dict,
     video_analyses: list,
     reuse_limit: int,
+    intro_skip_seconds: float = INTRO_SKIP_SECONDS,
 ) -> tuple:
     """
     Hungarian algorithm for global optimal clip assignment.
@@ -968,6 +974,7 @@ def _hungarian_assign(
     print(f"       beat_groups: {len(beat_groups)}")
     print(f"       video_paths: {len(video_paths)}")
     print(f"       reuse_limit: {reuse_limit}")
+    print(f"       intro_skip_seconds: {intro_skip_seconds:.1f}")
     total_cands = sum(len(cands) for vp in video_paths for cands in all_candidates.get(vp, {}).values())
     durations = set()
     for vp in video_paths:
@@ -984,13 +991,13 @@ def _hungarian_assign(
         from scipy.optimize import linear_sum_assignment
     except ImportError:
         print("       SciPy not available, falling back to greedy")
-        return _greedy_assign(beat_groups, video_paths, SCENE_THRESH, SAMPLE_INTERVAL, reuse_limit, True, None, music_analysis, video_analyses, all_candidates)
+        return _greedy_assign(beat_groups, video_paths, SCENE_THRESH, SAMPLE_INTERVAL, reuse_limit, True, None, music_analysis, video_analyses, all_candidates, intro_skip_seconds)
     
     # Fallback to greedy for large problems (cost matrix build is O(n_beats * n_cands))
     total_cands = sum(len(cands) for vp in video_paths for cands in all_candidates.get(vp, {}).values())
     if len(beat_groups) * total_cands > 5000:
         print(f"       Problem too large for Hungarian ({len(beat_groups)} beats × {total_cands} cands), using greedy")
-        return _greedy_assign(beat_groups, video_paths, SCENE_THRESH, SAMPLE_INTERVAL, reuse_limit, True, None, music_analysis, video_analyses, all_candidates)
+        return _greedy_assign(beat_groups, video_paths, SCENE_THRESH, SAMPLE_INTERVAL, reuse_limit, True, None, music_analysis, video_analyses, all_candidates, intro_skip_seconds)
     
     # Flatten all candidates with metadata
     all_cands_flat = []
@@ -1272,6 +1279,7 @@ def ai_assign_clips(
     cache_dir: str = None,
     music_analysis: dict = None,
     video_analyses: list = None,  # Pre-computed video analyses for cached scenes
+    intro_skip_seconds: float = INTRO_SKIP_SECONDS,
 ) -> list[dict]:
     """
     AI-assisted clip assignment with:
@@ -1359,6 +1367,7 @@ def ai_assign_clips(
                     compute_motion=compute_motion,
                     cache_dir=cache_dir,
                     cached_scenes=cached_scenes,
+                    intro_skip_seconds=intro_skip_seconds,
                 )
                 all_candidates[vp][duration] = candidates
 
@@ -1369,6 +1378,7 @@ def ai_assign_clips(
             music_analysis,
             video_analyses,
             reuse_limit,
+            intro_skip_seconds=intro_skip_seconds,
         )
     else:
         # Large problem: use greedy directly with pre_generated_candidates=None
@@ -1385,6 +1395,7 @@ def ai_assign_clips(
             music_analysis=music_analysis,
             video_analyses=video_analyses,
             pre_generated_candidates=None,  # Let greedy generate its own
+            intro_skip_seconds=intro_skip_seconds,
         )
 
     # Build result format compatible with existing sync_clips_with_beats output
@@ -1423,6 +1434,7 @@ def sync_clips_with_beats(
     reuse_limit=None,  # Auto-calculate if None
     compute_motion=True,
     music_analysis=None,
+    intro_skip_seconds=INTRO_SKIP_SECONDS,
 ):
     """
     Generate beat-synchronized clips from source videos.
@@ -1461,6 +1473,7 @@ def sync_clips_with_beats(
             compute_motion=compute_motion,
             cache_dir=cache_dir,
             music_analysis=music_analysis,
+            intro_skip_seconds=intro_skip_seconds,
         )
 
         if not ai_results:

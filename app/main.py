@@ -12,6 +12,7 @@ from app.video import (
     concatenate_videos,
     add_audio,
     encode_in_chunks,
+    INTRO_SKIP_SECONDS,
 )
 
 
@@ -106,6 +107,7 @@ def main():
             max_beats=8,
             ai_mode=True,
             music_analysis=music_analysis,
+            intro_skip_seconds=INTRO_SKIP_SECONDS,
         )
     )
 

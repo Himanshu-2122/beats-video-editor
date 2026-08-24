@@ -27,7 +27,7 @@ os.makedirs(UPLOAD_TEMP_DIR, exist_ok=True)
 UPLOAD_CHUNK_SIZE = 50 * 1024 * 1024  # 50MB
 
 from app.beat import analyze_music_full
-from app.video import analyze_video_full, process_clip, concatenate_videos, add_audio, encode_in_chunks, concat_group
+from app.video import analyze_video_full, process_clip, concatenate_videos, add_audio, encode_in_chunks, concat_group, INTRO_SKIP_SECONDS
 from app.sync import sync_clips_with_beats, ai_assign_clips
 from app.progress_tracker import ProgressTracker, create_default_stages
 
@@ -222,7 +222,7 @@ def run_generation(tracker, temp_dir, output_dir, video_paths, music_path, param
 
         def analyze_one(vp):
             print(f"   🔍 Analyzing: {os.path.basename(vp)}")
-            analysis = analyze_video_full(vp, cache_dir=os.path.join(temp_dir, "cache"), fast_mode=True)
+            analysis = analyze_video_full(vp, cache_dir=os.path.join(temp_dir, "cache"), fast_mode=True, intro_skip_seconds=params['intro_skip_seconds'])
             print(f"   ✅ Done: {os.path.basename(vp)} - {len(analysis.get('scenes', []))} scenes")
             return analysis
 
@@ -264,6 +264,7 @@ def run_generation(tracker, temp_dir, output_dir, video_paths, music_path, param
             cache_dir=cache_dir,
             music_analysis=music_analysis,
             video_analyses=video_analyses,
+            intro_skip_seconds=float(params['intro_skip_seconds']),
         )
 
         if not ai_results:
@@ -562,6 +563,17 @@ def main():
             chunk_size = st.number_input("Chunk size (s)", 10, 300, 60)
             
             st.markdown("---")
+            st.caption("Video Source Settings")
+            intro_skip_seconds = st.slider(
+                "Skip intro seconds (applies to all videos)",
+                min_value=0,
+                max_value=60,
+                value=int(INTRO_SKIP_SECONDS),
+                step=1,
+                help="Seconds to skip from the start of each source video (e.g., to skip sponsor/platform bumpers). Applied per-video independently."
+            )
+            
+            st.markdown("---")
             st.caption("Output Settings")
             target_resolution = st.selectbox(
                 "Target Resolution",
@@ -719,6 +731,7 @@ def main():
                 'chunk_size': chunk_size,
                 'target_width': target_width,
                 'target_height': target_height,
+                'intro_skip_seconds': intro_skip_seconds,
             }
             st.session_state.generation_running = True
             st.session_state.generation_result = None
