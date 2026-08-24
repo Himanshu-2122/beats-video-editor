@@ -182,9 +182,6 @@ def create_default_stages(total_duration: float) -> List[StageProgress]:
         StageProgress(name="Analyzing Music", weight=5),
         StageProgress(name="Analyzing Videos", weight=15),
         StageProgress(name="Discovering Clips", weight=10),
-        StageProgress(name="Scoring & Matching", weight=10),
-        StageProgress(name="Building Timeline", weight=10),
-        StageProgress(name="Planning Transitions", weight=5),
-        StageProgress(name="Rendering Video", weight=35),
+        StageProgress(name="Rendering Video (Single-Pass)", weight=60),
         StageProgress(name="Finalizing", weight=10),
     ]

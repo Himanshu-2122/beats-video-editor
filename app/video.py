@@ -18,6 +18,11 @@ TARGET_WIDTH = 1920
 TARGET_HEIGHT = 1080
 FPS = 30
 
+# Enable motion-aware FPS interpolation (minterpolate) for smoother playback.
+# WARNING: Significantly increases encoding time (2-5x slower).
+# Set to True for maximum quality, False for speed.
+USE_MINTERPOLATE = False
+
 # Scene detection threshold for candidate generation
 SCENE_THRESH = 0.3
 
@@ -35,9 +40,9 @@ MIN_BEATS_PER_CLIP = 4
 MAX_BEATS_PER_CLIP = 8
 
 # Motion analysis settings - OPTIMIZED FOR SPEED
-MOTION_SAMPLE_FPS = 1  # Sample frames at this rate for motion analysis (was 2)
+MOTION_SAMPLE_FPS = 0.5  # Sample frames at this rate for motion analysis (was 1)
 MOTION_WINDOW_SECONDS = 1.0  # Window size for motion averaging
-MOTION_DOWNSCALE = 0.125  # Downscale factor for faster optical flow (0.125 = 1/8 resolution, was 0.25)
+MOTION_DOWNSCALE = 0.0625  # Downscale factor for faster optical flow (0.0625 = 1/16 resolution, was 0.125)
 
 # Transition settings
 TRANSITION_DURATION = 0.4
@@ -129,27 +134,52 @@ def snap_to_frame(time_s: float, fps: int = FPS) -> float:
 
 def get_color_normalization_filter():
     """FFmpeg filter to normalize color/brightness/contrast across clips.
-    Reduced intensity to preserve source quality while maintaining consistency.
+    Enhanced with professional color grading curves for cinematic look.
     """
     return (
-        "eq=contrast=1.01:saturation=1.02:brightness=0.005:gamma=1.0,"
-        "hue=s=1.0"
+        # Color space conversion and curves for cinematic tone mapping
+        "colorspace=all=bt709:iall=bt601-6-625:fast=1,"
+        # Curves for highlight rolloff and shadow lift (cineon-style)
+        "curves=r='0/0 0.1/0.11 0.5/0.5 0.9/0.88 1/1':"
+        "g='0/0 0.1/0.11 0.5/0.5 0.9/0.88 1/1':"
+        "b='0/0 0.1/0.11 0.5/0.5 0.9/0.88 1/1',"
+        # Contrast, saturation, brightness, gamma - tuned for punchier but natural look
+        "eq=contrast=1.05:saturation=1.08:brightness=0.01:gamma=0.98,"
+        # Hue/saturation fine-tuning for skin tones
+        "hue=s=1.0:h=0,"
+        # S-curve for additional contrast in midtones
+        "curves=m='0/0 0.25/0.22 0.5/0.5 0.75/0.78 1/1'"
     )
 
 
 def get_video_filter(target_width: int = None, target_height: int = None):
-    """Full filter chain for final output - applied ONCE during transition/encode stage."""
+    """Full filter chain for final output - applied ONCE during transition/encode stage.
+    Uses high-quality lanczos scaling, optional motion-aware FPS conversion, and enhanced sharpening.
+    """
     tw = target_width if target_width is not None else TARGET_WIDTH
     th = target_height if target_height is not None else TARGET_HEIGHT
-    return (
+    
+    # FPS normalization: use minterpolate for motion-aware interpolation if enabled
+    if USE_MINTERPOLATE:
+        fps_filter = (
+            f"minterpolate=fps={FPS}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1,"
+            f"fps={FPS}:round=near"
+        )
+    else:
+        fps_filter = f"fps={FPS}:round=near"
+    
+    # Build filter chain as list for proper concatenation
+    filters = [
         f"scale={tw}:{th}:"
-        f"force_original_aspect_ratio=increase,"
-        f"crop={tw}:{th},"
-        f"setsar=1,"
-        f"fps={FPS}:round=near,"
-        f"{get_color_normalization_filter()},"
-        f"unsharp=3:3:0.5:3:3:0.2"
-    )
+        f"force_original_aspect_ratio=increase:"
+        f"flags=lanczos+accurate_rnd+full_chroma_int+full_chroma_inp",
+        f"crop={tw}:{th}",
+        "setsar=1",
+        fps_filter,
+        get_color_normalization_filter(),
+        "unsharp=5:5:0.35:5:5:0.2",
+    ]
+    return ",".join(filters)
 
 
 def extract_frame(video_path: str, time_s: float):
@@ -362,9 +392,9 @@ def get_video_hash(video_path: str) -> str:
 # ============================================================
 
 # Motion analysis settings - OPTIMIZED FOR SPEED
-MOTION_SAMPLE_FPS = 1  # Sample frames at this rate for motion analysis (was 2)
+MOTION_SAMPLE_FPS = 0.5  # Sample frames at this rate for motion analysis (was 1)
 MOTION_WINDOW_SECONDS = 1.0  # Window size for motion averaging
-MOTION_DOWNSCALE = 0.125  # Downscale factor for faster optical flow (0.125 = 1/8 resolution, was 0.25)
+MOTION_DOWNSCALE = 0.0625  # Downscale factor for faster optical flow (0.0625 = 1/16 resolution, was 0.125)
 
 
 def compute_optical_flow_magnitude(prev_frame, curr_frame):
@@ -454,45 +484,62 @@ def analyze_motion_at_candidates(
     candidates: list[dict],
     clip_duration: float,
     cache_dir: str = None,
+    beat_time: float = None,  # For prioritizing candidates near beat
+    max_motion_candidates: int = 50,  # Limit motion analysis to top-N candidates
 ) -> list[dict]:
     """
-    Compute motion scores for all candidates in parallel using ProcessPoolExecutor.
+    Compute motion scores for candidates in parallel using ThreadPoolExecutor.
     Adds 'motion_score' to each candidate dict.
+    Only analyzes top candidates (by scene_flag + proximity to beat) to save time.
     """
     import os
     import json
-    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from app.cache import cache_manager
 
-    # Check cache first
-    video_hash = get_video_hash(video_path)
-    cache_key = f"motion_{video_hash}_{clip_duration}.json"
-    cache_path = os.path.join(cache_dir, cache_key) if cache_dir else None
-
-    if cache_path and os.path.exists(cache_path):
-        try:
-            with open(cache_path, 'r') as f:
-                cached = json.load(f)
-            cached_dict = {c['t']: c['motion_score'] for c in cached}
-            for c in candidates:
-                c['motion_score'] = cached_dict.get(round(c['t'], 3), 0.0)
-            return candidates
-        except Exception:
-            pass
+    # Check cache first using CacheManager
+    cache_key = f"motion_{clip_duration}"
+    cached = cache_manager.load("motion", video_path, f"_{cache_key}")
+    if cached is not None:
+        cached_dict = {c['t']: c['motion_score'] for c in cached}
+        for c in candidates:
+            c['motion_score'] = cached_dict.get(round(c['t'], 3), 0.0)
+        return candidates
 
     if not candidates:
         return candidates
 
+    # Limit motion analysis to top candidates to save time
+    # Prioritize: scene_flag=True candidates first, then by proximity to beat_time
+    if len(candidates) > max_motion_candidates:
+        if beat_time is not None:
+            # Score candidates: scene_flag gets high priority, then proximity to beat
+            for c in candidates:
+                c['_motion_priority'] = (100 if c.get('scene_flag', False) else 0) - abs(c['t'] - beat_time)
+            candidates.sort(key=lambda x: x['_motion_priority'], reverse=True)
+        else:
+            # Just prioritize scene_flag candidates
+            candidates.sort(key=lambda x: (not x.get('scene_flag', False), x['t']))
+        
+        motion_candidates = candidates[:max_motion_candidates]
+        remaining_candidates = candidates[max_motion_candidates:]
+        print(f"       [analyze_motion_at_candidates] Limiting motion analysis to top {max_motion_candidates}/{len(candidates)} candidates")
+    else:
+        motion_candidates = candidates
+        remaining_candidates = []
+
     # Prepare arguments for parallel processing
-    tasks = [(video_path, c['t'], clip_duration) for c in candidates]
+    tasks = [(video_path, c['t'], clip_duration) for c in motion_candidates]
     
-    # Use ProcessPoolExecutor for CPU-bound optical flow computation
-    # Limit workers to avoid memory issues (each process loads video frames)
-    max_workers = min(len(candidates), os.cpu_count() or 4)
+    # Use ThreadPoolExecutor for CPU-bound optical flow computation
+    # OpenCV releases GIL during calcOpticalFlowFarneback, so threads are efficient
+    # and avoid process spawn overhead + memory duplication
+    max_workers = min(len(motion_candidates), os.cpu_count() or 4)
     
-    print(f"       [analyze_motion_at_candidates] Computing motion for {len(candidates)} candidates with {max_workers} workers...")
+    print(f"       [analyze_motion_at_candidates] Computing motion for {len(motion_candidates)} candidates with {max_workers} workers...")
     
     motion_results = {}
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_analyze_motion_segment_worker, task): i for i, task in enumerate(tasks)}
         for future in as_completed(futures):
             idx = futures[future]
@@ -503,19 +550,21 @@ def analyze_motion_at_candidates(
                 print(f"       [motion] Worker error for candidate {idx}: {e}")
                 motion_results[idx] = 0.0
 
-    # Apply results to candidates
-    for idx, c in enumerate(candidates):
+    # Apply results to motion candidates
+    for idx, c in enumerate(motion_candidates):
         c['motion_score'] = motion_results.get(idx, 0.0)
+    
+    # Set default motion_score for remaining candidates
+    for c in remaining_candidates:
+        c['motion_score'] = 0.0
+    
+    # Clean up priority key
+    for c in candidates:
+        c.pop('_motion_priority', None)
 
-    # Save to cache
-    if cache_dir:
-        try:
-            os.makedirs(cache_dir, exist_ok=True)
-            serializable = [{'t': c['t'], 'motion_score': c['motion_score']} for c in candidates]
-            with open(cache_path, 'w') as f:
-                json.dump(serializable, f)
-        except Exception:
-            pass
+    # Save to cache using CacheManager
+    serializable = [{'t': c['t'], 'motion_score': c['motion_score']} for c in candidates]
+    cache_manager.save("motion", video_path, serializable, f"_{cache_key}")
 
     return candidates
 
@@ -531,20 +580,23 @@ def _analyze_motion_segment_worker(args):
 # ============================================================
 #
 # Lower number = better quality / larger file
-#
-# 16 = Near Lossless / Maximum Quality
+# 12 = Near Lossless / Maximum Quality (best quality, ~20% slower than 16)
+# 13 = Near Lossless / Maximum Quality (slightly faster, still excellent)
+# 14 = Very High Quality (good balance)
+# 16 = Near Lossless / Maximum Quality (previous default)
 # 18 = Very High
 # 20 = High / Recommended
 # 22 = Balanced
 #
-QSV_QUALITY = 16
+QSV_QUALITY = 14
 QSV_PRESET = "slow"
 
 # CPU fallback settings.
+# CRF 12-14 = Visually transparent / Near-lossless (best quality)
 # CRF 15-16 = Visually transparent / Near-lossless
 # CRF 17-18 = High quality
-CPU_CRF = 16
-CPU_PRESET = "slow"
+CPU_CRF = 15
+CPU_PRESET = "slower"
 
 # ============================================================
 # TRANSITIONS
@@ -552,7 +604,7 @@ CPU_PRESET = "slow"
 
 TRANSITION_MIN_CLIPS = 4
 TRANSITION_MAX_CLIPS = 8
-TRANSITION_DURATION = 0.4
+TRANSITION_DURATION = 0.7
 TRANSITIONS = [
     "fade",
     "wipeleft",
@@ -845,15 +897,60 @@ def get_clip_trim_filter():
 
 
 def get_clip_normalize_filter(target_width: int = None, target_height: int = None):
-    """Full normalization filter: scale to target resolution preserving aspect ratio, pad to exact size, normalize fps/SAR."""
+    """Full normalization filter: scale to target resolution preserving aspect ratio, pad to exact size, normalize fps/SAR.
+    Uses high-quality lanczos scaling for per-clip normalization.
+    """
     tw = target_width if target_width is not None else TARGET_WIDTH
     th = target_height if target_height is not None else TARGET_HEIGHT
-    return (
-        f"scale={tw}:{th}:force_original_aspect_ratio=decrease,"
-        f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2,"
-        f"fps={FPS}:round=near,"
-        f"setsar=1"
-    )
+    
+    # FPS normalization: use minterpolate for motion-aware interpolation if enabled
+    if USE_MINTERPOLATE:
+        fps_filter = (
+            f"minterpolate=fps={FPS}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1,"
+            f"fps={FPS}:round=near"
+        )
+    else:
+        fps_filter = f"fps={FPS}:round=near"
+    
+    filters = [
+        f"scale={tw}:{th}:force_original_aspect_ratio=decrease:"
+        f"flags=lanczos+accurate_rnd+full_chroma_int+full_chroma_inp",
+        f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2",
+        fps_filter,
+        "setsar=1",
+    ]
+    return ",".join(filters)
+
+
+def get_clip_color_match_filter(target_width: int = None, target_height: int = None):
+    """Per-clip color matching filter for consistent tone/wb across clips.
+    Applies automatic white balance, histogram normalization, and color grading
+    to match clips from different sources/lighting conditions.
+    """
+    tw = target_width if target_width is not None else TARGET_WIDTH
+    th = target_height if target_height is not None else TARGET_HEIGHT
+    
+    # FPS normalization: use minterpolate for motion-aware interpolation if enabled
+    if USE_MINTERPOLATE:
+        fps_filter = (
+            f"minterpolate=fps={FPS}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1,"
+            f"fps={FPS}:round=near"
+        )
+    else:
+        fps_filter = f"fps={FPS}:round=near"
+    
+    filters = [
+        f"scale={tw}:{th}:force_original_aspect_ratio=decrease:"
+        f"flags=lanczos+accurate_rnd+full_chroma_int+full_chroma_inp",
+        f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2",
+        fps_filter,
+        "setsar=1",
+        "colorbalance=bs=0.00:gs=0.00:rs=0.00:bm=0.00:gm=0.00:rm=0.00:bh=0.00:gh=0.00:rh=0.00",
+        "normalize=smoothing=10",
+        get_color_normalization_filter(),
+        "unsharp=3:3:0.25:3:3:0.15",
+    ]
+    return ",".join(filters)
 
 
 def get_qsv_video_args():
@@ -900,7 +997,7 @@ def get_cpu_video_args():
         "-color_range",
         "tv",
         "-x264-params",
-        "colormatrix=bt709:colorprim=bt709:transfer=bt709:range=tv:deblock=0:0:psy-rd=1.0:0.15",
+        "colormatrix=bt709:colorprim=bt709:transfer=bt709:range=tv:deblock=0,0:psy-rd=1.0,0.15",
     ]
 
 
@@ -964,11 +1061,12 @@ def process_clip(video_path, duration, output_path, start_time=None, snap_frame:
 
     # Choose filter based on whether normalization is needed
     if needs_normalize:
-        # Full normalization: scale+pad+fps
-        video_filter = get_clip_normalize_filter(tw, th)
+        # Full normalization with per-clip color matching: scale+pad+fps+color_match
+        video_filter = get_clip_color_match_filter(tw, th)
     else:
         # Minimal filter for already-matching clips: just fps+setsar (fast with QSV)
-        video_filter = get_clip_trim_filter()
+        # But still apply color grading for consistency
+        video_filter = get_clip_trim_filter() + "," + get_color_normalization_filter() + ",unsharp=3:3:0.25:3:3:0.15"
 
     qsv_command = [
         "ffmpeg",
@@ -1479,25 +1577,21 @@ def analyze_video_full(video_path: str, cache_dir: str = None, fast_mode: bool =
     
     Args:
         video_path: Path to video file
-        cache_dir: Optional cache directory
+        cache_dir: Optional cache directory (deprecated, uses CacheManager)
         fast_mode: If True, skip heavy computations (motion profile, camera changes, quality, colors)
         intro_skip_seconds: Seconds to skip from start of video for analysis
     
     Returns:
         dict: Complete video analysis
     """
-    if cache_dir:
-        video_hash = get_video_hash(video_path)
-        # Include intro_skip_seconds in cache key to invalidate cache when it changes
-        cache_path = os.path.join(cache_dir, f"video_{video_hash}_skip{int(intro_skip_seconds)}.json")
-        if os.path.exists(cache_path):
-            try:
-                with open(cache_path, 'r') as f:
-                    cached = json.load(f)
-                print(f"       Loaded video analysis from cache: {os.path.basename(video_path)} (skip={intro_skip_seconds:.1f}s)")
-                return cached
-            except Exception:
-                pass
+    from app.cache import cache_manager
+    
+    # Use CacheManager with intro_skip_seconds in suffix for invalidation
+    suffix = f"_skip{int(intro_skip_seconds)}"
+    cached = cache_manager.load("video_analysis", video_path, suffix)
+    if cached is not None:
+        print(f"       Loaded video analysis from cache: {os.path.basename(video_path)} (skip={intro_skip_seconds:.1f}s)")
+        return cached
     
     print(f"       Analyzing video: {os.path.basename(video_path)} (intro_skip={intro_skip_seconds:.1f}s)")
     
@@ -1550,14 +1644,8 @@ def analyze_video_full(video_path: str, cache_dir: str = None, fast_mode: bool =
             "dominant_colors": dominant_colors,
         }
         
-        # Cache result
-        if cache_dir:
-            try:
-                os.makedirs(cache_dir, exist_ok=True)
-                with open(cache_path, 'w') as f:
-                    json.dump(result, f)
-            except Exception:
-                pass
+        # Cache result using CacheManager
+        cache_manager.save("video_analysis", video_path, result, suffix)
         
         print(f"       Video analysis complete: {len(scenes)} scenes, {len(highlights)} highlights, {len(camera_changes)} camera changes")
         return result
@@ -1904,3 +1992,168 @@ def analyze_dominant_colors(video_path: str, sample_fps: float = 0.5, intro_skip
         color_profile.append((float(t), [float(dominant_rgb[0]), float(dominant_rgb[1]), float(dominant_rgb[2])]))
     
     return color_profile
+
+
+def render_video_single_pass(
+    assignments: list[dict],
+    output_path: str,
+    music_path: str,
+    target_width: int = None,
+    target_height: int = None,
+    use_transitions: bool = True,
+    transition_duration: float = TRANSITION_DURATION,
+    logger=None,
+    progress_callback=None,
+) -> str:
+    """
+    Render final video in a SINGLE FFmpeg pass.
+    
+    Instead of: process_clip -> concat_group -> create_transition_video -> encode_in_chunks -> add_audio
+    
+    This does: trim + normalize + transitions + color grade + encode + mux audio = ONE pass
+    
+    Args:
+        assignments: List of dicts with keys: source_path, source_start, duration, 
+                     beat_strength, beat_energy, beat_type, music_start, music_end
+        output_path: Final output video path
+        music_path: Path to music file
+        target_width: Target width
+        target_height: Target height
+        use_transitions: Whether to apply transitions
+        transition_duration: Transition duration in seconds
+        logger: Optional logger callback
+        progress_callback: Optional progress callback
+    
+    Returns:
+        Output path
+    """
+    tw = target_width if target_width is not None else TARGET_WIDTH
+    th = target_height if target_height is not None else TARGET_HEIGHT
+    
+    if not assignments:
+        raise ValueError("No assignments provided")
+    
+    # Group assignments by source video to minimize input opens
+    # But we need them in timeline order for transitions
+    # So we'll use all assignments in order
+    
+    # Build filter_complex for single-pass rendering
+    # Each input: trim at source_start for duration -> normalize -> setpts
+    # Then xfade transitions -> final filter chain
+    
+    command = ["ffmpeg", "-y"]
+    
+    # Add all source videos as inputs (deduplicated)
+    unique_sources = []
+    source_to_input_idx = {}
+    for a in assignments:
+        src = a["source_path"]
+        if src not in source_to_input_idx:
+            source_to_input_idx[src] = len(unique_sources)
+            unique_sources.append(src)
+    
+    for src in unique_sources:
+        command.extend(["-i", src])
+    
+    # Add music as last input
+    music_input_idx = len(unique_sources)
+    command.extend(["-i", music_path])
+    
+    filters = []
+    
+    # For each assignment, create a trimmed+normalized stream
+    assignment_labels = []
+    cumulative_duration = 0.0
+    
+    for idx, a in enumerate(assignments):
+        src = a["source_path"]
+        input_idx = source_to_input_idx[src]
+        start_time = a["source_start"]
+        duration = a["duration"]
+        
+        # Trim and normalize in one filter chain per clip
+        # trim -> setpts -> scale/pad -> fps -> color_norm -> unsharp
+        label = f"[clip{idx}]"
+        trim_filter = (
+            f"[{input_idx}:v]"
+            f"trim=start={start_time:.3f}:duration={duration:.3f},"
+            f"setpts=PTS-STARTPTS,"
+            f"{get_clip_normalize_filter(tw, th)}"
+            f"{label}"
+        )
+        filters.append(trim_filter)
+        assignment_labels.append((label, duration))
+        cumulative_duration += duration
+    
+    # Apply transitions if requested
+    if use_transitions and len(assignment_labels) > 1:
+        print("\nAdding selective transitions (single-pass)...")
+        previous_label = assignment_labels[0][0]
+        
+        for i in range(1, len(assignment_labels)):
+            current_label, current_duration = assignment_labels[i]
+            prev_duration = assignment_labels[i-1][1]
+            
+            transition = random.choice(TRANSITIONS)
+            trans_dur = min(transition_duration, prev_duration / 2, current_duration / 2)
+            trans_dur = max(0.10, trans_dur)
+            offset = sum(assignment_labels[j][1] for j in range(i)) - trans_dur
+            output_label = f"[v{i}]"
+            
+            filters.append(
+                f"{previous_label}{current_label}xfade=transition={transition}:duration={trans_dur:.3f}:offset={offset:.3f}{output_label}"
+            )
+            
+            if logger:
+                logger(f"       Transition {i}: {transition} {trans_dur:.2f}s")
+            else:
+                print(f"       Transition {i}: {transition} {trans_dur:.2f}s")
+            
+            previous_label = output_label
+        
+        final_video_label = previous_label
+    else:
+        # No transitions: just concatenate
+        # Use concat filter
+        concat_inputs = "".join(label for label, _ in assignment_labels)
+        final_video_label = "[vout]"
+        filters.append(f"{concat_inputs}concat=n={len(assignment_labels)}:v=1:a=0{final_video_label}")
+    
+    # Apply final video filter chain (color grading, sharpening)
+    final_filter = f"{final_video_label}{get_video_filter(tw, th)}[outv]"
+    filters.append(final_filter)
+    
+    # Audio: just take the music input
+    filter_complex = ";".join(filters)
+    
+    command.extend([
+        "-filter_complex",
+        filter_complex,
+        "-map", "[outv]",
+        "-map", f"{music_input_idx}:a",
+        "-c:a", "aac",
+        "-b:a", "320k",
+        "-profile:a", "aac_low",
+        "-shortest",
+    ])
+    
+    # Use hardware encoder if available
+    use_qsv = check_qsv()
+    if use_qsv:
+        command.extend(get_qsv_video_args())
+    else:
+        command.extend(get_cpu_video_args())
+    
+    command.extend([
+        "-movflags", "+faststart",
+        output_path,
+    ])
+    
+    # Run with streaming for progress
+    total_duration = sum(a["duration"] for a in assignments)
+    run_ffmpeg_stream(command, logger=logger, progress_callback=progress_callback, total_duration=total_duration)
+    
+    if not os.path.exists(output_path):
+        raise RuntimeError("Single-pass render failed.")
+    
+    return output_path

@@ -30,6 +30,7 @@ from app.beat import analyze_music_full
 from app.video import analyze_video_full, process_clip, concatenate_videos, add_audio, encode_in_chunks, concat_group, INTRO_SKIP_SECONDS
 from app.sync import sync_clips_with_beats, ai_assign_clips
 from app.progress_tracker import ProgressTracker, create_default_stages
+from app.video import render_video_single_pass
 
 st.set_page_config(page_title="Beat Video Editor", layout="wide", initial_sidebar_state="collapsed")
 
@@ -215,33 +216,39 @@ def run_generation(tracker, temp_dir, output_dir, video_paths, music_path, param
             raise RuntimeError("Not enough beats detected in music.")
         tracker.complete_stage(0)
 
-        # STAGE 2: Video Analysis
-        print(f"\n🎬 STAGE 2: Video Analysis ({len(video_paths)} videos)")
-        tracker.start_stage(1, "Analyzing videos...")
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        def analyze_one(vp):
-            print(f"   🔍 Analyzing: {os.path.basename(vp)}")
-            analysis = analyze_video_full(vp, cache_dir=os.path.join(temp_dir, "cache"), fast_mode=True, intro_skip_seconds=params['intro_skip_seconds'])
-            print(f"   ✅ Done: {os.path.basename(vp)} - {len(analysis.get('scenes', []))} scenes")
-            return analysis
-
+        # STAGE 2: Video Analysis (optional - skip if lazy_video_analysis enabled)
         video_analyses = []
-        max_workers = min(len(video_paths), 4)
-        print(f"   🔧 Using {max_workers} worker threads")
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(analyze_one, vp): vp for vp in video_paths}
-            for i, future in enumerate(as_completed(futures)):
-                analysis = future.result()
-                video_analyses.append(analysis)
-                tracker.update_stats(
-                    videos_analyzed=i + 1,
-                    total_videos=len(video_paths),
-                    scenes_detected=sum(len(a['scenes']) for a in video_analyses)
-                )
-                tracker.update_stage_progress(1, (i + 1) / len(video_paths))
-        tracker.complete_stage(1)
-        print(f"   ✅ All {len(video_analyses)} videos analyzed")
+        if params.get('lazy_video_analysis', True):
+            print(f"\n🎬 STAGE 2: Skipping upfront video analysis (lazy mode enabled)")
+            tracker.start_stage(1, "Preparing videos (lazy)...")
+            tracker.update_stage_progress(1, 1.0)
+            tracker.complete_stage(1)
+        else:
+            print(f"\n🎬 STAGE 2: Video Analysis ({len(video_paths)} videos)")
+            tracker.start_stage(1, "Analyzing videos...")
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            def analyze_one(vp):
+                print(f"   🔍 Analyzing: {os.path.basename(vp)}")
+                analysis = analyze_video_full(vp, cache_dir=os.path.join(temp_dir, "cache"), fast_mode=True, intro_skip_seconds=params['intro_skip_seconds'])
+                print(f"   ✅ Done: {os.path.basename(vp)} - {len(analysis.get('scenes', []))} scenes")
+                return analysis
+
+            max_workers = min(len(video_paths), 4)
+            print(f"   🔧 Using {max_workers} worker threads")
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(analyze_one, vp): vp for vp in video_paths}
+                for i, future in enumerate(as_completed(futures)):
+                    analysis = future.result()
+                    video_analyses.append(analysis)
+                    tracker.update_stats(
+                        videos_analyzed=i + 1,
+                        total_videos=len(video_paths),
+                        scenes_detected=sum(len(a['scenes']) for a in video_analyses)
+                    )
+                    tracker.update_stage_progress(1, (i + 1) / len(video_paths))
+            tracker.complete_stage(1)
+            print(f"   ✅ All {len(video_analyses)} videos analyzed")
 
         # STAGE 3: Beat Groups & Clip Discovery
         print(f"\n🎯 STAGE 3: Beat Groups & Clip Discovery")
@@ -263,7 +270,7 @@ def run_generation(tracker, temp_dir, output_dir, video_paths, music_path, param
             compute_motion=bool(params['compute_motion']),
             cache_dir=cache_dir,
             music_analysis=music_analysis,
-            video_analyses=video_analyses,
+            video_analyses=video_analyses if not params.get('lazy_video_analysis', True) else None,
             intro_skip_seconds=float(params['intro_skip_seconds']),
         )
 
@@ -277,131 +284,141 @@ def run_generation(tracker, temp_dir, output_dir, video_paths, music_path, param
         )
         tracker.complete_stage(2)
 
-        # STAGE 4: Process Clips
-        print(f"\n✂️ STAGE 4: Processing Clips ({len(ai_results)} clips)")
-        tracker.start_stage(3, "Building timeline...")
-        tracker.update_stage_progress(3, 0.5, "Processing clips...")
-        clip_dir = os.path.join(temp_dir, "_final_clips")
-        os.makedirs(clip_dir, exist_ok=True)
-
-        final_clip_paths = []
-        used_beat_groups = []
-        total = len(ai_results)
-
-        for index, assignment in enumerate(ai_results):
-            source_path = assignment["source_path"]
-            duration = assignment["clip_duration"]
-            start_time = assignment["source_start"]
-            beat_group = {
-                "start": assignment["music_start"],
-                "end": assignment["music_end"],
-                "duration": duration,
-            }
-
-            clip_path = os.path.join(clip_dir, f"clip_{index + 1:04d}.mp4")
-
-            print(f"   🎬 Clip {index+1}/{total}: {os.path.basename(source_path)} [{start_time:.1f}s-{start_time+duration:.1f}s]")
-            
-            process_clip(
-                video_path=source_path,
-                duration=duration,
-                output_path=clip_path,
-                start_time=start_time,
-                snap_frame=True,
-                target_width=int(params['target_width']),
-                target_height=int(params['target_height']),
-            )
-            print(f"      ✅ Clip saved: {clip_path}")
-
-            final_clip_paths.append(clip_path)
-            used_beat_groups.append({
-                "clip_path": clip_path,
-                "source_path": source_path,
-                "music_start": beat_group["start"],
-                "music_end": beat_group["end"],
-                "clip_duration": duration,
-                "source_start": start_time,
-                "score": assignment["score"],
-                "scene_flag": assignment["scene_flag"],
-                "motion_score": assignment.get("motion_score", 0.0),
-                "beat_strength": assignment.get("beat_strength", 0.5),
-                "beat_energy": assignment.get("beat_energy", 0.5),
-                "beat_type": assignment.get("beat_type", "regular"),
-            })
-
-            tracker.update_stats(
-                clips_generated=index + 1,
-                generated_duration=sum(bg["clip_duration"] for bg in used_beat_groups)
-            )
-            tracker.update_stage_progress(3, (index + 1) / total)
-
-        tracker.complete_stage(3)
-        print(f"\n🔗 STAGE 5: Concatenate & Transitions")
-        tracker.start_stage(4, "Planning transitions...")
-        tracker.update_stage_progress(4, 0.3, "Planning transitions...")
-        tracker.update_stage_progress(4, 0.7, "Concatenating clips...")
-        video_no_audio = os.path.join(output_dir, "_video_no_audio.mp4")
-
-        print(f"   🔗 Concatenating {len(final_clip_paths)} clips...")
-        if params['use_transitions']:
-            print(f"   🎞️  With transitions (duration={params['transition_duration']}s)")
-            concatenate_videos(
-                final_clip_paths,
-                video_no_audio,
-                beat_groups=used_beat_groups,
-                transition_min=4,
-                transition_max=8,
-                transition_duration=float(params['transition_duration']),
-                target_width=int(params['target_width']),
-                target_height=int(params['target_height']),
-            )
-        else:
-            print(f"   🔗 Concatenating without transitions")
-            concat_group(final_clip_paths, video_no_audio)
-
-        print(f"   ✅ Concatenated: {video_no_audio}")
-        tracker.complete_stage(4)
-
-        # STAGE 6: Low-RAM Re-encode (Optional)
-        print(f"\n🎬 STAGE 6: Rendering Video")
-        tracker.start_stage(5, "Rendering video...")
-        final_input = video_no_audio
-        if params['use_low_ram']:
-            encoded_tmp = os.path.join(output_dir, "_video_encoded.mp4")
-            try:
-                def enc_progress(cur, total):
-                    tracker.update_stage_progress(5, cur / max(total, 1))
-                print(f"   🔄 Encoding in chunks (segment={params['chunk_size']}s)...")
-                encode_in_chunks(
-                    video_no_audio,
-                    encoded_tmp,
-                    segment_time=int(params['chunk_size']),
-                    progress_callback=enc_progress,
-                )
-                final_input = encoded_tmp
-                print(f"   ✅ Encoded: {encoded_tmp}")
-            except Exception as e:
-                print(f"   ⚠️  Chunked encoding failed, using original: {e}")
-                pass
-
-        tracker.update_stage_progress(5, 0.8, "Finalizing render...")
-        tracker.complete_stage(5)
-
-        # STAGE 7: Add Audio
-        print(f"\n🎵 STAGE 7: Adding Music")
-        tracker.start_stage(6, "Adding music...")
+        # STAGE 4: Single-pass render (replaces: process clips + concatenate + transitions + encode + add audio)
+        print(f"\n🎬 STAGE 4: Single-Pass Render ({len(ai_results)} clips)")
+        tracker.start_stage(3, "Rendering video (single-pass)...")
+        
         final_filename = f"beat_edit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
         final_path = os.path.join(OUTPUT_DIR, final_filename)
-        print(f"   🎵 Adding audio: {os.path.basename(music_path)}")
-        add_audio(final_input, music_path, final_path)
-        print(f"   ✅ Final video: {final_filename}")
-        tracker.complete_stage(6)
+        
+        def render_progress(cur, total):
+            tracker.update_stage_progress(3, cur / max(total, 1))
+        
+        try:
+            render_video_single_pass(
+                assignments=ai_results,
+                output_path=final_path,
+                music_path=music_path,
+                target_width=int(params['target_width']),
+                target_height=int(params['target_height']),
+                use_transitions=params['use_transitions'],
+                transition_duration=float(params['transition_duration']),
+                logger=lambda msg: print(f"   {msg}"),
+                progress_callback=render_progress,
+            )
+            print(f"   ✅ Final video: {final_filename}")
+        except Exception as e:
+            print(f"   ⚠️  Single-pass render failed, falling back to legacy pipeline: {e}")
+            # Fallback to legacy pipeline
+            tracker.update_stage_progress(3, 0.5, "Fallback: Processing clips...")
+            clip_dir = os.path.join(temp_dir, "_final_clips")
+            os.makedirs(clip_dir, exist_ok=True)
 
-        # STAGE 8: Finalizing
-        print(f"\n✅ STAGE 8: Finalizing")
-        tracker.start_stage(7, "Finalizing...")
-        tracker.update_stage_progress(7, 1.0)
-        tracker.complete_stage(7)
+            final_clip_paths = []
+            used_beat_groups = []
+            total = len(ai_results)
+
+            for index, assignment in enumerate(ai_results):
+                source_path = assignment["source_path"]
+                duration = assignment["clip_duration"]
+                start_time = assignment["source_start"]
+                beat_group = {
+                    "start": assignment["music_start"],
+                    "end": assignment["music_end"],
+                    "duration": duration,
+                }
+
+                clip_path = os.path.join(clip_dir, f"clip_{index + 1:04d}.mp4")
+
+                print(f"   🎬 Clip {index+1}/{total}: {os.path.basename(source_path)} [{start_time:.1f}s-{start_time+duration:.1f}s]")
+                
+                process_clip(
+                    video_path=source_path,
+                    duration=duration,
+                    output_path=clip_path,
+                    start_time=start_time,
+                    snap_frame=True,
+                    target_width=int(params['target_width']),
+                    target_height=int(params['target_height']),
+                )
+                print(f"      ✅ Clip saved: {clip_path}")
+
+                final_clip_paths.append(clip_path)
+                used_beat_groups.append({
+                    "clip_path": clip_path,
+                    "source_path": source_path,
+                    "music_start": beat_group["start"],
+                    "music_end": beat_group["end"],
+                    "clip_duration": duration,
+                    "source_start": start_time,
+                    "score": assignment["score"],
+                    "scene_flag": assignment["scene_flag"],
+                    "motion_score": assignment.get("motion_score", 0.0),
+                    "beat_strength": assignment.get("beat_strength", 0.5),
+                    "beat_energy": assignment.get("beat_energy", 0.5),
+                    "beat_type": assignment.get("beat_type", "regular"),
+                })
+
+                tracker.update_stats(
+                    clips_generated=index + 1,
+                    generated_duration=sum(bg["clip_duration"] for bg in used_beat_groups)
+                )
+                tracker.update_stage_progress(3, 0.5 + 0.3 * (index + 1) / total)
+
+            print(f"\n🔗 Fallback: Concatenate & Transitions")
+            video_no_audio = os.path.join(output_dir, "_video_no_audio.mp4")
+
+            print(f"   🔗 Concatenating {len(final_clip_paths)} clips...")
+            if params['use_transitions']:
+                print(f"   🎞️  With transitions (duration={params['transition_duration']}s)")
+                concatenate_videos(
+                    final_clip_paths,
+                    video_no_audio,
+                    beat_groups=used_beat_groups,
+                    transition_min=4,
+                    transition_max=8,
+                    transition_duration=float(params['transition_duration']),
+                    target_width=int(params['target_width']),
+                    target_height=int(params['target_height']),
+                )
+            else:
+                print(f"   🔗 Concatenating without transitions")
+                concat_group(final_clip_paths, video_no_audio)
+
+            print(f"   ✅ Concatenated: {video_no_audio}")
+
+            # Low-RAM Re-encode (Optional)
+            final_input = video_no_audio
+            if params['use_low_ram']:
+                encoded_tmp = os.path.join(output_dir, "_video_encoded.mp4")
+                try:
+                    def enc_progress(cur, total):
+                        tracker.update_stage_progress(3, 0.8 + 0.1 * cur / max(total, 1))
+                    print(f"   🔄 Encoding in chunks (segment={params['chunk_size']}s)...")
+                    encode_in_chunks(
+                        video_no_audio,
+                        encoded_tmp,
+                        segment_time=int(params['chunk_size']),
+                        progress_callback=enc_progress,
+                    )
+                    final_input = encoded_tmp
+                    print(f"   ✅ Encoded: {encoded_tmp}")
+                except Exception as e2:
+                    print(f"   ⚠️  Chunked encoding failed, using original: {e2}")
+                    pass
+
+            # Add Audio
+            print(f"\n🎵 Adding Music")
+            add_audio(final_input, music_path, final_path)
+            print(f"   ✅ Final video: {final_filename}")
+
+        tracker.complete_stage(3)
+
+        # STAGE 5: Finalizing (was stage 8)
+        print(f"\n✅ STAGE 5: Finalizing")
+        tracker.start_stage(4, "Finalizing...")
+        tracker.update_stage_progress(4, 1.0)
+        tracker.complete_stage(4)
 
         print(f"\n{'='*60}")
         print(f"🎉 GENERATION COMPLETE!")
@@ -561,6 +578,8 @@ def main():
             transition_duration = st.selectbox("Transition duration (s)", [0.2, 0.25, 0.3, 0.35, 0.4, 0.5], index=3)
             use_low_ram = st.checkbox("Low-RAM chunked encoding", True)
             chunk_size = st.number_input("Chunk size (s)", 10, 300, 60)
+            lazy_video_analysis = st.checkbox("Lazy video analysis (save RAM)", True, 
+                help="Analyze videos on-demand during clip assignment instead of upfront. Saves RAM for many videos. Uncheck to see scene count in progress tracker.")
             
             st.markdown("---")
             st.caption("Video Source Settings")
@@ -732,6 +751,7 @@ def main():
                 'target_width': target_width,
                 'target_height': target_height,
                 'intro_skip_seconds': intro_skip_seconds,
+                'lazy_video_analysis': lazy_video_analysis,
             }
             st.session_state.generation_running = True
             st.session_state.generation_result = None

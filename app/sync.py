@@ -265,6 +265,7 @@ def _greedy_assign(
     video_analyses: list = None,  # Pre-computed video analyses for cached scenes
     pre_generated_candidates: dict = None,  # Pre-generated candidates from caller
     intro_skip_seconds: float = INTRO_SKIP_SECONDS,
+    source_durations: dict = None,  # Pre-computed durations {video_path: duration}
 ) -> list[dict]:
     """
     Greedy assignment of clips to beats using:
@@ -305,11 +306,28 @@ def _greedy_assign(
     drops = music_analysis.get("drops", []) if music_analysis else []
     buildups = music_analysis.get("buildups", []) if music_analysis else []
 
-    # Build highlight map from video analyses for clip preference
+    # Build highlight map from video analyses for clip preference (highlights are pre-computed)
     video_highlights = {}
     if video_analyses:
         for va in video_analyses:
             video_highlights[va.get("path")] = va.get("highlights", [])
+
+    # Lazy scene cache: analyze videos on-demand for scenes (saves RAM for many videos)
+    _scene_cache = {}
+    def get_cached_scenes(vp):
+        if vp in _scene_cache:
+            return _scene_cache[vp]
+        if video_analyses:
+            for va in video_analyses:
+                if va.get("path") == vp:
+                    _scene_cache[vp] = va.get("scenes", [])
+                    return _scene_cache[vp]
+        # Not in pre-computed analyses: detect scenes now (lazy)
+        from app.video import detect_scenes_detailed
+        print(f"       [lazy] Detecting scenes for {os.path.basename(vp)}...")
+        scenes = detect_scenes_detailed(vp, intro_skip_seconds=intro_skip_seconds)
+        _scene_cache[vp] = scenes
+        return scenes
 
     # Track the earliest allowed timestamp per video for chronological ordering
     # Start cursor at intro_skip_seconds to enforce ascending order from valid region
@@ -338,13 +356,8 @@ def _greedy_assign(
         for vp in video_paths:
             all_candidates[vp] = {}
             
-            # Find cached scenes for this video
-            cached_scenes = None
-            if video_analyses:
-                for va in video_analyses:
-                    if va.get("path") == vp:
-                        cached_scenes = va.get("scenes", [])
-                        break
+            # Find cached scenes for this video (lazy)
+            cached_scenes = get_cached_scenes(vp)
             
             for duration in unique_durations:
                 candidates = generate_candidates(
@@ -470,7 +483,7 @@ def _greedy_assign(
             if not candidates:
                 continue
             
-            source_duration = get_video_duration(vp)
+            source_duration = source_durations.get(vp, 0.0) if source_durations else get_video_duration(vp)
             if source_duration <= 0:
                 continue
                 
@@ -650,7 +663,7 @@ def _greedy_assign(
                     usage_bonus = 0.50  # First round: strongly encourage all videos
                 
                 # Footage availability bonus: prefer videos with more unused duration
-                source_duration = get_video_duration(vp)
+                source_duration = source_durations.get(vp, 0.0) if source_durations else get_video_duration(vp)
                 used_duration = sum(end - start for start, end in used_source_intervals[vp])
                 unused_ratio = max(0.0, (source_duration - used_duration) / source_duration)
                 # Bonus up to 0.20 for videos with lots of unused footage
@@ -722,7 +735,7 @@ def _greedy_assign(
             # Prioritize videos with fewer clips used and more unused footage
             def _video_priority(vp):
                 clips_used = video_usage_count[vp]
-                source_duration = get_video_duration(vp)
+                source_duration = source_durations.get(vp, 0.0) if source_durations else get_video_duration(vp)
                 used_duration = sum(end - start for start, end in used_source_intervals[vp])
                 unused_ratio = max(0.0, (source_duration - used_duration) / source_duration) if source_duration > 0 else 0
                 # Lower priority score = better (less used, more fresh footage)
@@ -736,7 +749,7 @@ def _greedy_assign(
                 candidates = all_candidates.get(vp, {}).get(bucketed_duration, [])
                 if not candidates:
                     continue
-                source_duration = get_video_duration(vp)
+                source_duration = source_durations.get(vp, 0.0) if source_durations else get_video_duration(vp)
                 if source_duration <= 0:
                     continue
                 used_intervals = used_source_intervals[vp]
@@ -772,7 +785,7 @@ def _greedy_assign(
                     candidates = all_candidates.get(vp, {}).get(bucketed_duration, [])
                     if not candidates:
                         continue
-                    source_duration = get_video_duration(vp)
+                    source_duration = source_durations.get(vp, 0.0) if source_durations else get_video_duration(vp)
                     if source_duration <= 0:
                         continue
                     cursor = video_cursors[vp] if ENFORCE_ASCENDING_ORDER else 0.0
@@ -789,7 +802,7 @@ def _greedy_assign(
             # Phase 3 (no-reuse): Expand candidate search with wider sampling
             # Generate more candidates at finer intervals to find unused slots
             for vp in sorted_videos:
-                source_duration = get_video_duration(vp)
+                source_duration = source_durations.get(vp, 0.0) if source_durations else get_video_duration(vp)
                 if source_duration <= duration:
                     continue
                 used_intervals = used_source_intervals[vp]
@@ -823,7 +836,7 @@ def _greedy_assign(
                 # Phase 4 (was Phase 6): GUARANTEED ASSIGNMENT with HARD overlap check
                 # Search from cursor onwards for a non-overlapping slot
                 for vp in sorted_videos:
-                    source_duration = get_video_duration(vp)
+                    source_duration = source_durations.get(vp, 0.0) if source_durations else get_video_duration(vp)
                     cursor = video_cursors[vp] if ENFORCE_ASCENDING_ORDER else 0.0
                     search_start = cursor
                     max_iterations = int((source_duration - cursor) / 0.5) + 10
@@ -991,13 +1004,13 @@ def _hungarian_assign(
         from scipy.optimize import linear_sum_assignment
     except ImportError:
         print("       SciPy not available, falling back to greedy")
-        return _greedy_assign(beat_groups, video_paths, SCENE_THRESH, SAMPLE_INTERVAL, reuse_limit, True, None, music_analysis, video_analyses, all_candidates, intro_skip_seconds)
+        return _greedy_assign(beat_groups, video_paths, SCENE_THRESH, SAMPLE_INTERVAL, reuse_limit, True, None, music_analysis, video_analyses, all_candidates, intro_skip_seconds, source_durations=source_durations)
     
     # Fallback to greedy for large problems (cost matrix build is O(n_beats * n_cands))
     total_cands = sum(len(cands) for vp in video_paths for cands in all_candidates.get(vp, {}).values())
     if len(beat_groups) * total_cands > 5000:
         print(f"       Problem too large for Hungarian ({len(beat_groups)} beats × {total_cands} cands), using greedy")
-        return _greedy_assign(beat_groups, video_paths, SCENE_THRESH, SAMPLE_INTERVAL, reuse_limit, True, None, music_analysis, video_analyses, all_candidates, intro_skip_seconds)
+        return _greedy_assign(beat_groups, video_paths, SCENE_THRESH, SAMPLE_INTERVAL, reuse_limit, True, None, music_analysis, video_analyses, all_candidates, intro_skip_seconds, source_durations=source_durations)
     
     # Flatten all candidates with metadata
     all_cands_flat = []
@@ -1026,7 +1039,7 @@ def _hungarian_assign(
     if video_analyses:
         for va in video_analyses:
             video_highlights[va.get("path")] = va.get("highlights", [])
-    
+
     # Pre-compute used intervals per video (will be updated during assignment)
     used_intervals = {vp: [] for vp in video_paths}
     video_usage = {vp: 0 for vp in video_paths}
@@ -1278,12 +1291,12 @@ def ai_assign_clips(
     compute_motion: bool = True,
     cache_dir: str = None,
     music_analysis: dict = None,
-    video_analyses: list = None,  # Pre-computed video analyses for cached scenes
+    video_analyses: list = None,  # Pre-computed video analyses for cached scenes (optional)
     intro_skip_seconds: float = INTRO_SKIP_SECONDS,
 ) -> list[dict]:
     """
     AI-assisted clip assignment with:
-    - Scene detection
+    - Scene detection (lazy: only analyzes videos when needed)
     - Motion analysis (optical flow)
     - Diversity scoring
     - Beat energy matching (music-aware)
@@ -1295,6 +1308,24 @@ def ai_assign_clips(
     """
     music_duration = music_analysis.get("duration", 0.0) if music_analysis else None
     beat_groups = create_beat_groups(beat_times, min_beats, max_beats, music_duration=music_duration)
+    
+    # Lazy scene cache: analyze videos on-demand, cache results
+    # This avoids analyzing all videos upfront (saves RAM for many videos)
+    _scene_cache = {}
+    def get_cached_scenes(vp):
+        if vp in _scene_cache:
+            return _scene_cache[vp]
+        if video_analyses:
+            for va in video_analyses:
+                if va.get("path") == vp:
+                    _scene_cache[vp] = va.get("scenes", [])
+                    return _scene_cache[vp]
+        # Not in pre-computed analyses: detect scenes now (lazy)
+        from app.video import detect_scenes_detailed
+        print(f"       [lazy] Detecting scenes for {os.path.basename(vp)}...")
+        scenes = detect_scenes_detailed(vp, intro_skip_seconds=intro_skip_seconds)
+        _scene_cache[vp] = scenes
+        return scenes
     if not beat_groups:
         return []
 
@@ -1302,7 +1333,8 @@ def ai_assign_clips(
     # PRE-FLIGHT CHECK: Validate total source duration vs music duration
     # ============================================================
     total_music_duration = sum(bg["duration"] for bg in beat_groups)
-    total_source_duration = sum(get_video_duration(vp) for vp in video_paths)
+    source_durations = {vp: get_video_duration(vp) for vp in video_paths}
+    total_source_duration = sum(source_durations.values())
     
     # Calculate maximum usable source duration based on reuse policy
     if ALLOW_CLIP_REUSE:
@@ -1351,12 +1383,7 @@ def ai_assign_clips(
         all_candidates = {}
         for vp in video_paths:
             all_candidates[vp] = {}
-            cached_scenes = None
-            if video_analyses:
-                for va in video_analyses:
-                    if va.get("path") == vp:
-                        cached_scenes = va.get("scenes", [])
-                        break
+            cached_scenes = get_cached_scenes(vp)
             for duration in unique_durations:
                 candidates = generate_candidates(
                     vp,
@@ -1396,6 +1423,7 @@ def ai_assign_clips(
             video_analyses=video_analyses,
             pre_generated_candidates=None,  # Let greedy generate its own
             intro_skip_seconds=intro_skip_seconds,
+            source_durations=source_durations,
         )
 
     # Build result format compatible with existing sync_clips_with_beats output

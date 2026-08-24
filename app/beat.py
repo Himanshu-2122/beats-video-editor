@@ -103,18 +103,13 @@ def analyze_music_full(audio_path, cache_dir=None):
     Returns:
         dict: Complete music analysis
     """
-    cache_path = None
-    if cache_dir:
-        video_hash = _get_file_hash(audio_path)
-        cache_path = os.path.join(cache_dir, f"music_{video_hash}.json")
-        if os.path.exists(cache_path):
-            try:
-                with open(cache_path, 'r') as f:
-                    cached = json.load(f)
-                print(f"       Loaded music analysis from cache")
-                return cached
-            except Exception:
-                pass
+    from app.cache import cache_manager
+    
+    # Use CacheManager for consistent caching
+    cached = cache_manager.load("music_analysis", audio_path)
+    if cached is not None:
+        print(f"       Loaded music analysis from cache")
+        return cached
 
     try:
         print("       Performing full music analysis...")
@@ -280,14 +275,8 @@ def analyze_music_full(audio_path, cache_dir=None):
             "duration": float(duration)
         }
         
-        # Cache result
-        if cache_path:
-            try:
-                os.makedirs(cache_dir, exist_ok=True)
-                with open(cache_path, 'w') as f:
-                    json.dump(result, f)
-            except Exception:
-                pass
+        # Cache result using CacheManager
+        cache_manager.save("music_analysis", audio_path, result)
         
         print(f"       Music analysis complete: {len(beats)} beats, {len(drops)} drops, {len(buildups)} buildups, {len(sections)} sections")
         return result
