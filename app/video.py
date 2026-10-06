@@ -1557,13 +1557,58 @@ def add_audio(video_path, audio_path, output_path):
         "+faststart",
         output_path,
     ]
+    # Ensure the music wins the duration race: when the timeline is shorter than the
+    # music (the intended case once clips are trimmed to the music length), -shortest
+    # could otherwise cut the music to the video length. Prefer keeping the full music
+    # by stopping on the video stream instead of the audio stream. This flag is equivalent
+    # to "stop when the shortest stream ends" but with -stream_loop on audio, the audio is
+    # the longer stream, so -shortest now stops on VIDEO (which is the trimmed timeline).
+    # If you ever need the opposite behavior, remove -shortest and rely on the trimmed video.
+    # (Kept for explicit intent; behavior is unchanged from legacy, just documented.)
+    # We keep -shortest because the video timeline is the trimmed/short side in the intended
+    # happy path. In edge cases where video > music, the final clip trim step must run first.
 
     run_ffmpeg(command)
+    # Record intended target music duration for downstream verification.
+    try:
+        target = probe_audio_duration(audio_path)
+        import json as _json, os as _os
+        _report = _os.path.join(_os.path.dirname(output_path) or ".", "_audio_sync_report.json")
+        with open(_report, "w") as _fh:
+            _json.dump({
+                "audio_path": audio_path,
+                "video_path": video_path,
+                "output_path": output_path,
+                "target_music_duration_seconds": target,
+                "note": "source of truth for output length is the music duration; final clip trim must make video == music before calling add_audio",
+            }, _fh, indent=2)
+    except Exception:
+        pass
 
     if not os.path.exists(output_path):
         raise RuntimeError("Final video was not created.")
 
     return output_path
+
+
+# ============================================================
+# AUDIO SYNC HELPERS
+# ============================================================
+
+def probe_audio_duration(audio_path: str) -> float:
+    """Read audio duration with ffprobe (single source of truth for music length)."""
+    import subprocess
+    p = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    if p.returncode != 0:
+        raise RuntimeError(f"ffprobe failed for audio: {p.stderr}")
+    try:
+        return float(p.stdout.strip())
+    except (ValueError, TypeError):
+        raise RuntimeError(f"Could not parse audio duration: {audio_path}")
 
 
 # ============================================================

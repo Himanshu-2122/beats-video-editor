@@ -23,20 +23,21 @@ def _get_beats_cached(audio_path):
         y, sr = librosa.load(
             audio_path,
             sr=None,
-            mono=True,
+            mono=False,
         )
-
-        tempo, beat_frames = librosa.beat.beat_track(
-            y=y,
-            sr=sr,
-        )
+        # beat_track(y=...) can return no beats on some librosa versions for clean mono
+        # inputs. Use a robust path: compute onset envelope and track beats from it.
+        mono = y.mean(axis=0) if y.ndim > 1 else y
+        hop_length = 512
+        onset_env = librosa.onset.onset_strength(y=mono, sr=sr, hop_length=hop_length)
+        tempo, beat_frames = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr, hop_length=hop_length)
 
         try:
             tempo_value = float(np.squeeze(tempo))
         except Exception:
             tempo_value = tempo
 
-        beat_times = librosa.frames_to_time(beat_frames, sr=sr)
+        beat_times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=hop_length)
         beat_times = np.asarray(beat_times, dtype=float)
 
         if beat_times.size == 0:

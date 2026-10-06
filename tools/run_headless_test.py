@@ -16,7 +16,7 @@ from app.video import concatenate_videos, encode_in_chunks, add_audio
 def parse_args():
     parser = argparse.ArgumentParser(description="Headless test runner for beats-video-editor")
     parser.add_argument("--ai", action="store_true", help="Enable AI-assisted clip matching")
-    parser.add_argument("--debug", action="store_true", help="Write debug output (sync_debug_ai.json)")
+    parser.add_argument("--debug", action="store_true", help="Write debug output (sync_debug_ai.json) and print duration diagnostics")
     parser.add_argument("--sample-interval", type=float, default=0.5, help="Uniform sampling interval in seconds (AI mode)")
     parser.add_argument("--scene-threshold", type=float, default=0.3, help="Scene detection threshold (AI mode)")
     parser.add_argument("--reuse-limit", type=int, default=2, help="Max clips per source video (AI mode)")
@@ -63,23 +63,24 @@ def main():
     # Run sync to create clips
     print("Syncing clips with beats...")
     video_paths = [os.path.join(DATA_VIDEOS, f) for f in os.listdir(DATA_VIDEOS) if f.lower().endswith('.mp4')]
-    
-    sync_kwargs = {
-        "min_beats": args.min_beats,
-        "max_beats": args.max_beats,
-    }
-    
-    if args.ai:
-        sync_kwargs.update({
-            "ai_mode": True,
-            "sample_interval": args.sample_interval,
-            "scene_threshold": args.scene_threshold,
-            "reuse_limit": args.reuse_limit,
-            "compute_motion": args.compute_motion,
-        })
-        print(f"AI mode enabled: sample_interval={args.sample_interval}, scene_threshold={args.scene_threshold}, reuse_limit={args.reuse_limit}, compute_motion={args.compute_motion}")
 
     clip_paths, beat_groups, temp_dir = sync_clips_with_beats(video_paths, beats, **sync_kwargs)
+
+    # Report target vs actual durations
+    music_duration = None
+    if music_analysis and isinstance(music_analysis, dict):
+        md = music_analysis.get("duration", None)
+        if isinstance(md, (int, float)):
+            music_duration = float(md)
+    if music_duration is None or music_duration <= 0:
+        music_duration = float(beats[-1]["time"]) if beats else 0.0
+
+    total_clip_duration = sum(bg.get("clip_duration", 0.0) for bg in beat_groups)
+    print(f"TARGET music_duration={music_duration:.3f}s  total_clip_duration={total_clip_duration:.3f}s  clip_count={len(clip_paths)}")
+    print(f"DEBUG: beat_groups={len(beat_groups)}")
+    for i, bg in enumerate(beat_groups):
+        print(f"DEBUG beat_group#{i+1}: start={bg.get('start',0):.3f} end={bg.get('end',0):.3f} dur={bg.get('clip_duration', bg.get('duration',0)):.3f} src_start={bg.get('source_start',0):.3f}")
+
     print(f"Created {len(clip_paths)} clips in {temp_dir}")
     if not clip_paths:
         print("No clips created; exiting.")
@@ -102,9 +103,19 @@ def main():
 
     print("Test pipeline complete. Output:", final)
 
-    # Cleanup temp dir
+    # Verify final output
     try:
         import shutil
+        total_video_duration = float(subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", final],
+            stdout=subprocess.PIPE, text=True).stdout.strip())
+        print(f"FINAL output duration={total_video_duration:.3f}s  music_duration={music_duration:.3f}s  delta={total_video_duration - music_duration:+.3f}s")
+    except Exception as exc:
+        print(f"Could not probe final output: {exc}")
+
+    # Cleanup temp dir
+    try:
         shutil.rmtree(temp_dir, ignore_errors=True)
     except Exception:
         pass

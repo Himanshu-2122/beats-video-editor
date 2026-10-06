@@ -41,6 +41,11 @@ MAX_CLIPS_PER_SOURCE = 0
 # Minimum gap between clips from same source (seconds)
 # Already defined in video.py as MIN_CLIP_GAP = 3.0
 
+# Required policy: keep adding UNIQUE clips until the timeline reaches the music duration.
+# Do NOT stop at a fixed clip count or a fixed total length, do NOT freeze/loop/stretch,
+# and only the final clip may be trimmed to land exactly on the music end.
+REQUIRE_VIDEO_COVERS_MUSIC = True
+
 # Transition types by energy level
 TRANSITIONS_CALM = ["fade", "dissolve", "fadeblack", "fadewhite", "fadeslow", "smoothleft", "smoothright", "smoothup", "smoothdown"]
 TRANSITIONS_MEDIUM = ["wipeleft", "wiperight", "wipeup", "wipedown", "slideleft", "slideright", "slideup", "slidedown", "circlecrop", "rectcrop", "distance", "radial", "circleopen", "circleclose", "vertopen", "vertclose", "horzopen", "horzclose"]
@@ -160,6 +165,41 @@ def create_beat_groups(
             print(f"       Added synthetic groups to cover full duration: {music_duration:.2f}s")
 
     return groups
+
+
+def _assert_ascend_no_overlap(assignments, music_duration, source_durations, intro_skip_seconds):
+    """Post-condition checks that the timeline obeys the required behavior.
+
+    These checks are informational (they log loudly) and help catch regressions.
+    They do NOT change behavior at runtime.
+    """
+    from app.video import get_video_duration as _gvd
+    logger_lines = []
+    logger_lines.append(f"[BEHAVIOR CHECK] assignments={len(assignments)}")
+    total_video = 0.0
+    prev_end = None
+    for i, a in enumerate(assignments):
+        vp = a.get("video_path") or a.get("source_path")
+        start = float(a["source_start"])
+        dur = float(a.get("duration") or a.get("clip_duration") or 0.0)
+        end = start + dur
+        sdur = source_durations.get(vp) if source_durations else None
+        if sdur is None:
+            sdur = _gvd(vp)
+        source_durations[vp] = sdur
+        total_video += dur
+        msg = f"[BEHAVIOR CHECK] clip#{i+1} {os.path.basename(vp)} src_start={start:.3f} dur={dur:.3f} end={end:.3f} src_dur={sdur:.3f}"
+        if prev_end is not None and start < prev_end - 1e-6:
+            msg += f"  <<< VIOLATION: not ascending (prev_end={prev_end:.3f})"
+        if end > sdur + 1e-6:
+            msg += f"  <<< VIOLATION: clip past source end"
+        logger_lines.append(msg)
+        prev_end = end
+    logger_lines.append(f"[BEHAVIOR CHECK] total_video_duration={total_video:.3f}s  music_duration={music_duration:.3f}s")
+    if prev_end is not None:
+        logger_lines.append(f"[BEHAVIOR CHECK] last_clip_end={prev_end:.3f}s")
+    print("\n" + "\n".join(logger_lines) + "\n")
+    return total_video
 
 
 def _compute_diversity_penalty(cand_time: float, duration: float, used_intervals: list[tuple], source_duration: float) -> float:
@@ -1000,12 +1040,16 @@ def _hungarian_assign(
             print(f"         {os.path.basename(vp)} dur={dur:.2f}s: {len(cands)} candidates")
     print(f"{'='*60}\n")
     
+    # Pre-compute video durations up-front so every fallback path uses the same
+    # concrete value and never references an uninitialized local.
+    source_durations = {vp: get_video_duration(vp) for vp in video_paths}
+
     try:
         from scipy.optimize import linear_sum_assignment
     except ImportError:
         print("       SciPy not available, falling back to greedy")
         return _greedy_assign(beat_groups, video_paths, SCENE_THRESH, SAMPLE_INTERVAL, reuse_limit, True, None, music_analysis, video_analyses, all_candidates, intro_skip_seconds, source_durations=source_durations)
-    
+
     # Fallback to greedy for large problems (cost matrix build is O(n_beats * n_cands))
     total_cands = sum(len(cands) for vp in video_paths for cands in all_candidates.get(vp, {}).values())
     if len(beat_groups) * total_cands > 5000:
@@ -1306,9 +1350,38 @@ def ai_assign_clips(
         source_path, music_start, music_end, clip_duration,
         source_start, score, scene_flag, motion_score, beat_strength, beat_energy, beat_type
     """
-    music_duration = music_analysis.get("duration", 0.0) if music_analysis else None
+    # Single source of truth for the target timeline length: the music duration.
+    # Prefer analyzed music duration, probe the audio file, else fall back to last beat.
+    music_duration = None
+    if music_analysis and isinstance(music_analysis, dict):
+        md = music_analysis.get("duration", None)
+        if isinstance(md, (int, float)):
+            music_duration = float(md)
+    if music_duration is None or music_duration <= 0:
+        probed = None
+        for _path in video_paths:
+            _ext = os.path.splitext(_path)[1].lower()
+            if _ext in (".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".wma"):
+                try:
+                    probed = probe_audio_duration(_path)
+                    if probed and probed > 0:
+                        break
+                except Exception:
+                    probed = None
+        if probed and probed > 0:
+            music_duration = probed
+        else:
+            _last = beat_times[-1] if beat_times else 0.0
+        if isinstance(_last, dict):
+            _last = float(_last.get("time", 0.0))
+        elif not isinstance(_last, (int, float)):
+            _last = 0.0
+        music_duration = float(_last)
+
     beat_groups = create_beat_groups(beat_times, min_beats, max_beats, music_duration=music_duration)
-    
+    if not beat_groups:
+        return [], [], {}, {}
+
     # Lazy scene cache: analyze videos on-demand, cache results
     # This avoids analyzing all videos upfront (saves RAM for many videos)
     _scene_cache = {}
@@ -1326,8 +1399,6 @@ def ai_assign_clips(
         scenes = detect_scenes_detailed(vp, intro_skip_seconds=intro_skip_seconds)
         _scene_cache[vp] = scenes
         return scenes
-    if not beat_groups:
-        return []
 
     # ============================================================
     # PRE-FLIGHT CHECK: Validate total source duration vs music duration
@@ -1359,6 +1430,10 @@ def ai_assign_clips(
         # But warn user it may produce repetitive results
     
     # Enforce no clip reuse if ALLOW_CLIP_REUSE is False
+    # Even with ALLOW_CLIP_REUSE=False, the assignment loop must be able to place
+    # enough UNIQUE clips to reach the music duration. reuse_limit is only a
+    # per-video cap on how many clips we may draw from one source; it must be
+    # large enough that the timeline is not artificially capped short.
     if not ALLOW_CLIP_REUSE:
         reuse_limit = 100
     elif reuse_limit is None:
@@ -1369,6 +1444,14 @@ def ai_assign_clips(
     num_durations = len(set(round(bg["duration"] * 20) / 20 for bg in beat_groups))
     est_total_cands = len(video_paths) * num_durations * 10
     use_hungarian = len(beat_groups) * est_total_cands <= 5000
+
+    # Do not allow the assignment to stop early just because a conservative
+    # "usable footage" estimate said there is not enough. The timeline must keep
+    # adding UNIQUE clips until it reaches music_duration; if the source cannot
+    # provide that many unique seconds, the final clip trim/extend step will
+    # report the shortfall rather than silently capping the timeline short.
+    print(f"[DIAG] ai_assign_clips: music_duration={music_duration:.3f}s, total_source_duration={total_source_duration:.3f}s")
+    print(f"[DIAG] ai_assign_clips: allowing assignment to continue toward music_duration (no hard cap from conservative usable estimate)")
 
     print(f"       [DIAG] ai_assign_clips: beat_groups={len(beat_groups)}, est_total_cands={est_total_cands}, use_hungarian={use_hungarian}")
 
@@ -1482,10 +1565,42 @@ def sync_clips_with_beats(
     if not video_paths:
         return [], [], output_dir
 
+    # Single source of truth for the target timeline length: the music duration.
+    # Read it from the analyzed music when available, otherwise probe the file.
+    music_duration = None
+    if music_analysis and isinstance(music_analysis, dict):
+        md = music_analysis.get("duration", None)
+        if isinstance(md, (int, float)):
+            music_duration = float(md)
+
     # Normalize beats
     beats = _normalize_beats(beat_times)
     if len(beats) < 2:
         return [], [], output_dir
+
+    # Single source of truth for the target timeline length: the music duration.
+    # Prefer the analyzed music duration, then probe the audio file, then fall back to
+    # the last detected beat time. This must be the SAME value used when building
+    # beat groups so the timeline targets the music, not a hardcoded/clip-count limit.
+    if music_duration is None or music_duration <= 0:
+        probed = None
+        # Only probe audio if one of the provided paths looks like an audio file.
+        for _path in video_paths:
+            _ext = os.path.splitext(_path)[1].lower()
+            if _ext in (".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".wma"):
+                try:
+                    probed = probe_audio_duration(_path)
+                    if probed and probed > 0:
+                        break
+                except Exception:
+                    probed = None
+        if probed and probed > 0:
+            music_duration = probed
+        else:
+            music_duration = float(beats[-1]["time"]) if beats else 0.0
+
+    # Build beat groups against the SAME music_duration used as the source of truth.
+    beat_groups = create_beat_groups(beats, min_beats, max_beats, music_duration=music_duration)
 
     if ai_mode:
         # AI-assisted mode
@@ -1521,6 +1636,7 @@ def sync_clips_with_beats(
                 "start": assignment["music_start"],
                 "end": assignment["music_end"],
                 "duration": duration,
+                "source_start": start_time,
             }
 
             clip_path = os.path.join(clip_dir, f"clip_{index + 1:04d}.mp4")
@@ -1560,36 +1676,134 @@ def sync_clips_with_beats(
             if progress_callback:
                 progress_callback(index + 1, total)
 
-        # Write AI debug output
-        debug_path = os.path.join(output_dir, "sync_debug_ai.json")
-        try:
-            # Prepare candidates serializable format
-            candidates_serializable = {}
+        # Post-condition: verify behavior requirements (ascending, coverage, etc.)
+        _source_durations = {}
+        _assert_ascend_no_overlap(used_beat_groups, music_duration, _source_durations, intro_skip_seconds)
+
+        print(f"[DURATION CHECK] music_duration_source_of_truth={music_duration:.3f}s  clips_assigned={len(used_beat_groups)}  total_clip_duration_before_trim={sum(bg['clip_duration'] for bg in used_beat_groups):.3f}s")
+        print(f"[DURATION CHECK] beat_groups_target_end={beat_groups[-1]['end']:.3f}s  music_duration={music_duration:.3f}s")
+
+        return final_clip_paths, used_beat_groups, output_dir
+
+    # Original random mode (legacy)
+    if not beat_groups:
+        return [], [], output_dir
+
+    number_of_clips = min(len(video_paths), len(beat_groups))
+    selected_videos = random.sample(video_paths, number_of_clips)
+
+    print("\nRandomly selected:")
+    for path in selected_videos:
+        print(f"  {os.path.basename(path)}")
+
+    selected_videos.sort(key=natural_sort_key)
+    print("\nFinal ascending order:")
+    for index, path in enumerate(selected_videos, start=1):
+        print(f"  {index:03d} -> {os.path.basename(path)}")
+
+    final_clip_paths = []
+    used_beat_groups = []
+    total = len(selected_videos)
+
+    for index, source_path in enumerate(selected_videos):
+        beat_group = beat_groups[index]
+        duration = beat_group["duration"]
+
+        source_duration = get_video_duration(source_path)
+        if source_duration <= 0:
+            print(f"Skipping invalid video: {source_path}")
+            continue
+
+        if source_duration > duration:
+            max_start = source_duration - duration
+            start_time = random.uniform(0, max_start)
+        else:
+            start_time = 0.0
+            duration = source_duration
+
+        if duration <= 0:
+            continue
+
+        clip_path = os.path.join(clip_dir, f"clip_{index + 1:04d}.mp4")
+
+        print(f"\nFinal clip {index + 1}/{total}")
+        print(f"Source: {os.path.basename(source_path)}")
+        print(f"Music start: {beat_group['start']:.3f}s")
+        print(f"Music end:   {beat_group['end']:.3f}s")
+        print(f"Duration:    {duration:.3f}s")
+        print(f"Source start: {start_time:.3f}s")
+
+        process_clip(
+            video_path=source_path,
+            duration=duration,
+            output_path=clip_path,
+            start_time=start_time,
+            snap_frame=True,
+        )
+
+        final_clip_paths.append(clip_path)
+        used_beat_groups.append({
+            "clip_path": clip_path,
+            "source_path": source_path,
+            "music_start": beat_group["start"],
+            "music_end": beat_group["end"],
+            "clip_duration": duration,
+            "source_start": start_time,
+        })
+
+        if progress_callback:
+            progress_callback(index + 1, total)
+
+    print(f"[DURATION CHECK] music_duration_source_of_truth={music_duration:.3f}s  clips_assigned={len(used_beat_groups)}  total_clip_duration_before_trim={sum(bg['clip_duration'] for bg in used_beat_groups):.3f}s")
+
+    debug_path = os.path.join(output_dir, "sync_debug.json")
+    try:
+        with open(debug_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "beat_groups": used_beat_groups,
+                "music_duration_source_of_truth": music_duration,
+                "clip_durations_in_seconds": [float(bg.get("clip_duration", bg.get("duration", 0))) for bg in used_beat_groups],
+            }, f, indent=2)
+        print(f"\nSync debug written to: {debug_path}")
+    except Exception as exc:
+        print(f"Warning: Could not write sync debug: {exc}")
+
+    return final_clip_paths, used_beat_groups, output_dir
+
+    # Write AI debug output (executed when ai_mode branch returned above via the earlier
+    # return; kept here as a fallback for the legacy code path if needed).
+    debug_path = os.path.join(output_dir, "sync_debug_ai.json")
+    try:
+        # Prepare candidates serializable format
+        candidates_serializable = {}
+        if all_candidates:
             for vp, cands in all_candidates.items():
                 candidates_serializable[vp] = [
                     {"t": c["t"], "scene_flag": c.get("scene_flag", False), "motion_score": c.get("motion_score", 0.0)} for c in cands
                 ]
 
-            with open(debug_path, "w", encoding="utf-8") as f:
-                json.dump({
-                    "beat_times": [{"time": b["time"], "strength": b["strength"], "energy": b.get("energy", 0.5)} for b in beats],
-                    "beat_groups": [{"start": bg["start"], "end": bg["end"], "duration": bg["duration"], "strength": bg.get("strength", 0.5)} for bg in beat_groups],
-                    "candidates": candidates_serializable,
-                    "scores": {str(k): v for k, v in debug_scores.items()},
-                    "assignments": used_beat_groups,
-                    "total_music_duration": beats[-1]["time"] if beats else 0,
-                    "config": {
-                        "sample_interval": sample_interval,
-                        "scene_threshold": scene_threshold,
-                        "reuse_limit": reuse_limit,
-                        "compute_motion": compute_motion,
-                    },
-                }, f, indent=2)
-            print(f"\nAI sync debug written to: {debug_path}")
-        except Exception as exc:
-            print(f"Warning: Could not write AI sync debug: {exc}")
+        with open(debug_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "beat_times": [{"time": b["time"], "strength": b["strength"], "energy": b.get("energy", 0.5)} for b in beats],
+                "beat_groups": [{"start": bg["start"], "end": bg["end"], "duration": bg["duration"], "strength": bg.get("strength", 0.5)} for bg in beat_groups],
+                "candidates": candidates_serializable,
+                "scores": {str(k): v for k, v in debug_scores.items()},
+                "assignments": used_beat_groups,
+                "music_duration_source_of_truth": music_duration,
+                "total_music_duration_from_beats": beats[-1]["time"] if beats else 0,
+                "clip_durations_in_seconds": [float(bg.get("clip_duration", bg.get("duration", 0))) for bg in used_beat_groups],
+                "config": {
+                    "sample_interval": sample_interval,
+                    "scene_threshold": scene_threshold,
+                    "reuse_limit": reuse_limit,
+                    "compute_motion": compute_motion,
+                },
+            }, f, indent=2)
+        print(f"\nAI sync debug written to: {debug_path}")
+    except Exception as exc:
+        print(f"Warning: Could not write AI sync debug: {exc}")
 
-        return final_clip_paths, used_beat_groups, output_dir
+    return final_clip_paths, used_beat_groups, output_dir
 
     # Original random mode (legacy)
     beat_groups = create_beat_groups(beats, min_beats, max_beats)
@@ -1666,7 +1880,8 @@ def sync_clips_with_beats(
         with open(debug_path, "w", encoding="utf-8") as f:
             json.dump({
                 "beat_groups": used_beat_groups,
-                "total_music_duration": beats[-1]["time"] if beats else 0,
+                "music_duration_source_of_truth": music_duration,
+                "clip_durations_in_seconds": [float(bg.get("clip_duration", bg.get("duration", 0))) for bg in used_beat_groups],
             }, f, indent=2)
         print(f"\nSync debug written to: {debug_path}")
     except Exception as exc:
