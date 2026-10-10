@@ -29,19 +29,21 @@ class CacheManager:
         self._hash_lock = threading.Lock()
 
     def get_file_hash(self, filepath: str) -> str:
-        """Generate hash for file based on path, size, and mtime."""
+        """Generate a hash that invalidates when the file changes at the same path."""
         with self._hash_lock:
-            if filepath in self._file_hashes:
-                return self._file_hashes[filepath]
-            
             try:
                 stat = os.stat(filepath)
-                content = f"{filepath}:{stat.st_size}:{stat.st_mtime}"
-                hash_val = hashlib.md5(content.encode()).hexdigest()[:16]
-                self._file_hashes[filepath] = hash_val
-                return hash_val
+                identity = f"{filepath}:{stat.st_size}:{stat.st_mtime_ns}:{stat.st_ino}"
             except Exception:
-                return hashlib.md5(filepath.encode()).hexdigest()[:16]
+                identity = f"{filepath}:missing"
+
+            current = self._file_hashes.get(filepath)
+            if current is not None and current[0] == identity:
+                return current[1]
+
+            hash_val = hashlib.md5(identity.encode()).hexdigest()[:16]
+            self._file_hashes[filepath] = (identity, hash_val)
+            return hash_val
 
     def get_cache_path(self, category: str, file_hash: str, suffix: str = "") -> Path:
         """Get cache file path for a category and file hash."""
@@ -88,7 +90,7 @@ class CacheManager:
 
     def clear_all(self):
         """Clear all cache."""
-        for cat in ["beats", "scenes", "motion", "video_analysis", "embeddings"]:
+        for cat in ["beats", "scenes", "motion", "video_analysis", "music_analysis", "embeddings"]:
             self.clear_category(cat)
 
 

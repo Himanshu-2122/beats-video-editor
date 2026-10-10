@@ -1,3 +1,23 @@
+"""
+Music beat detection and analysis module.
+
+Responsibility:
+- Detect musical beats from audio files using librosa
+- Provide comprehensive music analysis including tempo, beats, energy curve,
+  drops, buildups, and section labels
+- Support caching of analysis results for performance
+
+Key Functions:
+- get_beats(): Detect beats from audio file (simple beat tracking)
+- analyze_music_full(): Comprehensive analysis with energy, drops, buildups, sections
+- get_beat_times(): Legacy adapter returning just timestamps
+
+Dependencies:
+- librosa: Beat tracking, onset strength, RMS energy, chroma features
+- numpy: Numerical operations
+- app.cache: Caching infrastructure
+"""
+
 import librosa
 import numpy as np
 import json
@@ -9,8 +29,26 @@ def get_beats(audio_path):
     """
     Detect musical beats from an audio file.
 
+    Uses librosa onset strength envelope and beat tracking to find musical beats.
+    Results are cached per audio file path for performance.
+
     Returns:
-        list[dict]: list of dicts with 'time' (float) and 'strength' (float 0-1)
+        list[dict]: list of dicts with 'time' (float, seconds from start)
+                    and 'strength' (float 0-1, normalized beat strength).
+                    Returns empty list if no beats detected.
+
+    Raises:
+        None: Errors are caught and an empty list is returned.
+
+    Side Effects:
+        Prints detection progress to stdout (tempo, beat count, average strength).
+
+    Example:
+        >>> beats = get_beats("song.mp3")
+        >>> len(beats)
+        42
+        >>> beats[0]
+        {"time": 0.5, "strength": 0.87}
     """
     return _get_beats_cached(audio_path)
 
@@ -101,8 +139,67 @@ def analyze_music_full(audio_path, cache_dir=None):
     """
     Comprehensive music analysis: beats, energy, drops, buildups, sections.
     
+    Performs full audio analysis using librosa to extract:
+    - Beat tracking (tempo and beat timestamps)
+    - Normalized beat strength from onset envelope
+    - RMS energy curve in sliding windows (normalized 0-1)
+    - Beat energy at each beat position
+    - Drop detection: sudden energy increases + spectral flux peaks
+    - Buildup detection: sustained energy increases over 4+ beats
+    - Section labeling using chroma features and energy profiling
+    
+    Uses CacheManager for consistent caching of results per audio file.
+    The cache_dir parameter is accepted for interface compatibility but
+    the global CacheManager instance is used.
+    
+    Args:
+        audio_path (str): Path to audio file (MP3, WAV, M4A, AAC supported)
+        cache_dir (str, optional): Deprecated; use global CacheManager instead.
+            Not actually used for cache selection in current implementation.
+    
     Returns:
-        dict: Complete music analysis
+        dict: Complete music analysis with the following keys:
+            - bpm (float): Detected tempo in beats per minute
+            - beats (list[dict]): List of beat dicts with 'time' and 'strength'
+              and optional 'energy' key. Beats are timestamps in seconds from
+              audio start, strength is normalized 0-1.
+            - drops (list[dict]): Detected drop timestamps with 'time' (float)
+              and 'intensity' (float 0-1). A drop is a sudden energy increase
+              accompanied by a spectral flux peak.
+            - buildups (list[dict]): Detected buildup segments with 'start',
+              'end' (floats in seconds) and 'intensity' (float 0-1). A buildup
+              is a sustained energy rise over at least 4 beats.
+            - sections (list[dict]): Detected sections with 'label', 'start',
+              'end' (floats) and 'energy' (float 0-1). Labels are from
+              ['intro', 'verse', 'chorus', 'drop', 'bridge', 'outro'] and
+              are assigned based on mean energy in the segment.
+            - energy_curve (list[tuple]): List of (time, energy) tuples
+              representing normalized RMS energy at regular intervals across
+              the full duration, energy normalized to 0-1 range.
+            - duration (float): Audio duration in seconds.
+    
+    Raises:
+        None: All exceptions are caught internally. On error, a minimal fallback
+            result is returned with bpm=120.0, empty beats list, and basic
+            structure.
+    
+    Side Effects:
+        Prints analysis progress to stdout including tempo, beat count,
+        drop/buildup/section counts, and analysis completion status.
+        Uses CacheManager which may read/write JSON cache files.
+    
+    Example:
+        >>> result = analyze_music_full("song.mp3")
+        >>> result["bpm"]
+        124.5
+        >>> len(result["beats"])
+        42
+        >>> len(result["drops"])
+        3
+        >>> len(result["energy_curve"])
+        100
+        >>> result["duration"]
+        185.5
     """
     from app.cache import cache_manager
     
@@ -298,7 +395,21 @@ def analyze_music_full(audio_path, cache_dir=None):
 
 
 def _get_file_hash(filepath):
-    """Generate hash for caching."""
+    """Generate hash for caching.
+    
+    Creates a hash based on file path, size, and modification time.
+    The hash is used as a cache key that invalidates when the file
+    changes at the same path (size or mtime change).
+    
+    Args:
+        filepath (str): Path to the file to hash
+    
+    Returns:
+        str: 16-character MD5 hash hex digest
+    
+    Side Effects:
+        Uses os.stat() to read file metadata. No file contents are read.
+    """
     import hashlib
     stat = os.stat(filepath)
     content = f"{filepath}:{stat.st_size}:{stat.st_mtime}"
@@ -307,6 +418,23 @@ def _get_file_hash(filepath):
 
 # Backward compatibility
 def get_beat_times(audio_path):
-    """Return just beat timestamps as list[float] for legacy code."""
+    """Return just beat timestamps as list[float] for legacy code.
+    
+    Convenience adapter that calls get_beats() and extracts just the timestamps.
+    
+    Args:
+        audio_path (str): Path to audio file
+    
+    Returns:
+        list[float]: List of beat timestamps in seconds from audio start.
+                     Returns empty list if no beats detected.
+    
+    Example:
+        >>> times = get_beat_times("song.mp3")
+        >>> times[0]
+        0.5
+        >>> len(times)
+        42
+    """
     beats = get_beats(audio_path)
     return [b["time"] for b in beats]

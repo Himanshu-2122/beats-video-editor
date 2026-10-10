@@ -394,7 +394,7 @@ def run_generation(tracker, temp_dir, output_dir, video_paths, music_path, param
                 try:
                     def enc_progress(cur, total):
                         tracker.update_stage_progress(3, 0.8 + 0.1 * cur / max(total, 1))
-                    print(f"   🔄 Encoding in chunks (segment={params['chunk_size']}s)...")
+                    print(f"   🔄 Remuxing (no re-encode, segment={params['chunk_size']}s)...")
                     encode_in_chunks(
                         video_no_audio,
                         encoded_tmp,

@@ -39,7 +39,7 @@ class ProgressTracker:
         self.stages = stages
         self.total_duration = total_duration
         self.frontend_callback = frontend_callback
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.start_time = time.time()
         self.current_stage_idx = 0
         self.stage_history: List[Dict] = []
@@ -149,11 +149,16 @@ class ProgressTracker:
         return f"{bar} {int(progress * 100)}%"
 
     def _notify(self):
-        if self.frontend_callback:
-            try:
-                self.frontend_callback(self.get_dashboard_data())
-            except Exception:
-                pass
+        if not self.frontend_callback:
+            return
+        try:
+            payload = self.get_dashboard_data()
+        except Exception:
+            return
+        try:
+            self.frontend_callback(payload)
+        except Exception:
+            pass
 
     def get_dashboard_data(self) -> Dict:
         with self.lock:

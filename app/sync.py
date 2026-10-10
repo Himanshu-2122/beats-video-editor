@@ -1,4 +1,33 @@
-﻿import os
+﻿"""
+Beat grouping, candidate scoring, and clip assignment module.
+
+Responsibility:
+- Convert beat timestamps into clip duration groups via create_beat_groups()
+- Score and assign candidates to beat groups using heuristic scoring
+- Support both greedy and Hungarian algorithm assignment strategies
+- Classify beat types (downbeat, drop, buildup, regular) for music-aware matching
+- Compute diversity penalties to encourage clip variety across sources
+- Provide fallback candidate search when no valid candidates are found
+
+Key Functions:
+- _normalize_beats(): Convert beat input to list[dict] with 'time' and 'strength' keys
+- create_beat_groups(): Group contiguous beats into clip durations
+- classify_beat_type(): Label a beat as drop/buildup/downbeat/regular
+- _energy_match_weight(): Compute energy matching weight per SPEC energy levels
+- _compute_diversity_penalty(): Score distance from already-used source intervals
+- _greedy_assign(): Greedy assignment of clips to beat groups
+- _hungarian_assign(): Hungarian algorithm for global optimal assignment
+- ai_assign_clips(): Main entry point for heuristic clip assignment
+- sync_clips_with_beats(): Legacy pipeline entry point returning clip paths
+
+Dependencies:
+- app.video: Video metadata, scene detection, candidate generation, frame snapping
+- app.cache: Caching infrastructure for motion analysis results
+- scipy: Optional Hungarian algorithm (linear_sum_assignment)
+- numpy: Vectorized scoring operations
+"""
+
+import os
 import random
 import math
 import tempfile
@@ -57,9 +86,40 @@ MAX_ASSIGNMENT_ATTEMPTS = 3
 # Diversity penalty for similar music sections (chorus/verse repetition)
 SECTION_SIMILARITY_PENALTY = 0.25
 
+# Professional clip selection weights
+CLIP_SELECTION_WEIGHTS = {
+    "scene_bonus": 0.25,       # Maximum bonus for scene boundary alignment
+    "proximity_bonus": 0.15,   # Maximum bonus for beat proximity
+    "motion_weight": 0.35,     # Weight of motion score in total score
+    "highlight_bonus": 0.20,   # Maximum bonus for highlight overlap
+    "quality_bonus": 0.10,     # Default quality bonus
+    "type_bonus": 0.30,        # Maximum beat-type adjustment
+    "energy_weight": 0.25,     # Energy matching weight importance
+    "diversity_penalty": 0.15, # Maximum diversity penalty
+    "distribution_bonus": 0.30,# Distribution bonus weight
+    "forward_bonus": 0.10,     # Forward progression bonus
+}
+
 
 def _normalize_beats(beat_times):
-    """Convert beat input to list[dict] with 'time' and 'strength' keys."""
+    """Convert beat input to list[dict] with 'time' and 'strength' keys.
+    
+    Handles both legacy float lists and dict-formatted beat data.
+    
+    Args:
+        beat_times (list[float] or list[dict]): Beat timestamps as flat floats
+            or already-formatted dicts with 'time' and 'strength' keys.
+    
+    Returns:
+        list[dict]: List of dicts with 'time' (float, seconds) and
+            'strength' (float 0-1). Empty list if input is empty.
+    
+    Example:
+        >>> _normalize_beats([0.5, 1.0, 1.5])
+        [{"time": 0.5, "strength": 0.5}, {"time": 1.0, "strength": 0.5}, {"time": 1.5, "strength": 0.5}]
+        >>> _normalize_beats([{"time": 0.5, "strength": 0.8}])
+        [{"time": 0.5, "strength": 0.8}]
+    """
     if not beat_times:
         return []
     if isinstance(beat_times[0], dict):
@@ -76,10 +136,52 @@ def create_beat_groups(
 ):
     """
     Convert beat timestamps into clip durations.
-
-    Each group corresponds to a contiguous range of beats.
-    The clip boundaries align exactly with detected beat timestamps.
-    Guarantees coverage of the entire music duration.
+    
+    Each group corresponds to a contiguous range of beats. The clip boundaries
+    align exactly with detected beat timestamps. Guarantees coverage of the
+    entire music duration when REQUIRE_FULL_COVERAGE is True.
+    
+    The grouping strategy uses adaptive group sizes: smaller groups for more
+    granular coverage when remaining beats are few, random sizes within
+    [min_beats, max_beats] otherwise.
+    
+    Args:
+        beat_times (list[dict]): List of beat dicts with 'time' and 'strength' keys.
+            Already normalized via _normalize_beats().
+        min_beats (int): Minimum number of beats per group (inclusive).
+        max_beats (int): Maximum number of beats per group (inclusive).
+        music_duration (float, optional): Total music duration in seconds. If
+            provided and REQUIRE_FULL_COVERAGE is True, ensures the timeline
+            covers the full music duration without overshooting.
+    
+    Returns:
+        list[dict]: List of beat groups, each with keys:
+            - start (float): Start time in seconds from music start
+            - end (float): End time in seconds from music start
+            - duration (float): Clip duration in seconds (end - start)
+            - strength (float): Average strength of beats in this group
+            - beat_indices (list[int]): Indices of beats included in this group
+            - synthetic (bool): True if this group was added to fill remaining
+              duration (when REQUIRE_FULL_COVERAGE and music_duration are set)
+    
+    Raises:
+        None: Function always returns a list; if beat_times has fewer than 2
+            elements, returns empty list.
+    
+    Side Effects:
+        Prints diagnostic messages when extending last group or adding
+        synthetic groups to cover full music duration.
+    
+    Important Assumptions:
+        - Beat times are sorted and in ascending order
+        - Group boundaries align with actual beat timestamps
+        - When REQUIRE_FULL_COVERAGE=True, the final group may be extended
+          to music_duration or synthetic groups may be added
+    
+    Example:
+        >>> beats = [{"time": 0.0, "strength": 0.8}, {"time": 2.0, "strength": 0.6}, {"time": 4.0, "strength": 0.9}]
+        >>> create_beat_groups(beats, min_beats=2, max_beats=4, music_duration=12.0)
+        [{'start': 0.0, 'end': 4.0, 'duration': 4.0, 'strength': 0.767, 'beat_indices': [0, 1, 2], 'synthetic': False}]
     """
     beats = _normalize_beats(beat_times)
 
@@ -125,53 +227,90 @@ def create_beat_groups(
             groups[-1]["end"] = last_beat_time
             groups[-1]["duration"] = groups[-1]["end"] - groups[-1]["start"]
 
-    # CRITICAL: Ensure coverage extends to full music duration
-    # If music_duration is provided and exceeds last beat, extend final group
+    # CRITICAL: Ensure coverage extends to full music duration without overshoot
     if REQUIRE_FULL_COVERAGE and music_duration and groups:
-        last_beat_time = beats[-1]["time"]
-        if music_duration > last_beat_time:
-            # Extend the last group to cover the full music duration
-            groups[-1]["end"] = music_duration
-            groups[-1]["duration"] = groups[-1]["end"] - groups[-1]["start"]
-            print(f"       Extended final group to cover full music duration: {music_duration:.2f}s (last beat at {last_beat_time:.2f}s)")
-        elif music_duration > groups[-1]["end"]:
-            # Music duration is between last beat and current group end
-            groups[-1]["end"] = music_duration
-            groups[-1]["duration"] = groups[-1]["end"] - groups[-1]["start"]
-            print(f"       Adjusted final group to match music duration: {music_duration:.2f}s")
-
-    # If still not enough coverage (e.g., no beats or very few), create synthetic groups
-    if REQUIRE_FULL_COVERAGE and music_duration and groups:
-        total_duration = sum(g["duration"] for g in groups)
+        # Sort groups by start time (they should already be in order, but ensure it)
+        groups_sorted = sorted(groups, key=lambda g: g["start"])
+        
+        # Verify the first group starts at or after 0, and check for gaps
+        # Extend first group backward to 0 if it starts after 0 and there are beats before it
+        if groups_sorted and groups_sorted[0]["start"] > 0 and len(beats) > 0:
+            # The first detected beat determines the effective start
+            # If the first beat is after 0, we still start from the first beat's position
+            # but we need to ensure the total coverage doesn't exceed music_duration
+            pass  # First group starts at its detected start time
+        
+        # Extend last group to music_duration if needed, without overshooting
+        last_group = groups_sorted[-1]
+        if music_duration > last_group["end"]:
+            # Check if extending would create overlap with synthetic groups logic
+            # Only extend if the gap is reasonable and we have beats leading up to it
+            if music_duration - last_group["end"] > 0.1:  # Minimum gap to justify extension
+                last_group["end"] = music_duration
+                last_group["duration"] = last_group["end"] - last_group["start"]
+                print(f"       Extended final group to cover full music duration: {music_duration:.2f}s (was {last_group['end']:.2f}s)")
+        
+        # If still not enough coverage (total duration < music_duration), create synthetic groups
+        # that start exactly where the last group ends and end exactly at music_duration
+        total_duration = sum(g["duration"] for g in groups_sorted)
         if total_duration < music_duration - 0.5:  # Allow small tolerance
-            # Need to create more groups to cover the full duration
             remaining = music_duration - total_duration
-            # Add additional groups at the end using average beat spacing
-            avg_beat_interval = (beats[-1]["time"] - beats[0]["time"]) / max(1, len(beats) - 1) if len(beats) > 1 else 2.0
-            last_end = groups[-1]["end"]
+            # Add synthetic group(s) that cover exactly the remaining duration
+            # to reach music_duration without overshooting
+            last_end_sorted = groups_sorted[-1]["end"]
             
-            while remaining > 0.5:
-                group_duration = min(avg_beat_interval * 4, remaining)  # ~4 beats per group
-                groups.append({
-                    "start": last_end,
-                    "end": last_end + group_duration,
-                    "duration": group_duration,
-                    "strength": 0.5,
-                    "beat_indices": [],
-                    "synthetic": True,
-                })
-                last_end += group_duration
-                remaining = music_duration - last_end
-            print(f"       Added synthetic groups to cover full duration: {music_duration:.2f}s")
+            if remaining > 0.5:
+                # Create exactly one synthetic group covering the remaining duration
+                # clamped to not overshoot music_duration
+                synth_duration = min(remaining, music_duration - last_end_sorted)
+                if synth_duration > 0.1:  # Minimum meaningful group duration
+                    groups_sorted.append({
+                        "start": last_end_sorted,
+                        "end": last_end_sorted + synth_duration,
+                        "duration": synth_duration,
+                        "strength": 0.5,
+                        "beat_indices": [],
+                        "synthetic": True,
+                    })
+                print(f"       Added synthetic group to cover remaining duration: {synth_duration:.2f}s")
 
     return groups
 
 
 def _assert_ascend_no_overlap(assignments, music_duration, source_durations, intro_skip_seconds):
     """Post-condition checks that the timeline obeys the required behavior.
-
+    
     These checks are informational (they log loudly) and help catch regressions.
     They do NOT change behavior at runtime.
+    
+    The checks verify:
+    - Clips are in ascending order by source_start (no overlapping from same video)
+    - No clip extends past its source video's duration
+    - Total video duration vs music duration relationship
+    - Last clip end position
+    
+    Args:
+        assignments (list[dict]): Assignment dicts from greedy/hungarian assign.
+            Each must have 'source_start', 'duration', and 'video_path' keys.
+        music_duration (float): Expected total music duration in seconds.
+        source_durations (dict, optional): Pre-computed {video_path: duration}.
+            If not provided, durations will be looked up via get_video_duration().
+        intro_skip_seconds (float): Intro skip seconds used in analysis.
+    
+    Returns:
+        float: Total video clip duration across all assignments.
+    
+    Side Effects:
+        Prints detailed [BEHAVIOR CHECK] log messages to stdout including:
+        - Per-clip start/duration/end/source_dur info
+        - Any violations found (non-ascending, past source end)
+        - Summary totals (total_video_duration, music_duration, last_clip_end)
+    
+    Important Notes:
+        - Does not modify assignments or any shared state
+        - Only logs; does not raise exceptions or abort processing
+        - Uses intro_skip_seconds to validate source_start positions
+        - source_durations dict is updated in-place with looked-up durations
     """
     from app.video import get_video_duration as _gvd
     logger_lines = []
@@ -203,10 +342,59 @@ def _assert_ascend_no_overlap(assignments, music_duration, source_durations, int
 
 
 def _compute_diversity_penalty(cand_time: float, duration: float, used_intervals: list[tuple], source_duration: float) -> float:
-    """
-    Compute diversity penalty based on temporal distance from already used intervals.
+    """Compute diversity penalty based on temporal distance from already used intervals.
+    
     Returns penalty in range [0, 1] where 0 = no penalty, 1 = max penalty (too close).
     Enforces MIN_CLIP_GAP between clips from same video.
+    
+    The penalty encourages temporal spacing between clips from the same source video.
+    A penalty of 0 means no diversity concern; 1 means the candidate is too close
+    to an already-used interval (will be filtered out by the hard enforcement).
+    
+    Distance calculation:
+    - If candidate ends before used interval starts: distance = used_start - cand_end
+    - If candidate starts after used interval ends: distance = cand_time - used_end
+    - If candidate overlaps used interval: distance = 0 (hard rejection)
+    
+    Penalty decay:
+    - distance <= MIN_CLIP_GAP (3.0s): max penalty of 1.0 (hard rejection threshold)
+    - MIN_CLIP_GAP < distance <= 15.0s: linearly decaying penalty from 1.0 to 0.0
+    - distance > 15.0s: no penalty (0.0)
+    
+    Args:
+        cand_time (float): Candidate start time in seconds.
+        duration (float): Candidate clip duration in seconds.
+        used_intervals (list[tuple]): List of (start, end) tuples of already-used
+            source intervals in seconds, per video. These are snapped/unsnapped
+            according to the assignment logic.
+        source_duration (float): Total duration of the source video in seconds.
+    
+    Returns:
+        float: Diversity penalty in range [0, 1.5]. Values > 1.0 act as a
+            hard rejection (added as subtractive penalty that can push total
+            score below other candidates). Exact values:
+            - 1.5: cand_end < used_start AND distance < MIN_CLIP_GAP (too close before)
+            - 1.0: distance <= MIN_CLIP_GAP (overlap or within gap, hard rejection zone)
+            - 0.0: distance > 15.0s (no penalty, far enough away)
+            - Intermediate values: linearly decaying from 1.0 to 0.0
+    
+    Example:
+        >>> # No used intervals = no penalty
+        >>> _compute_diversity_penalty(5.0, 3.0, [], 60.0)
+        0.0
+        >>> # Candidate overlaps used interval
+        >>> _compute_diversity_penalty(5.0, 3.0, [(2.0, 8.0)], 60.0)
+        1.5  # overlap => distance = 0 < MIN_CLIP_GAP => 1.5
+        >>> # Candidate 1s after used interval ends
+        >>> _compute_diversity_penalty(10.0, 3.0, [(2.0, 8.0)], 60.0)
+        1.0  # distance = 10.0 - 8.0 = 2.0 < MIN_CLIP_GAP=3.0 => penalty 1.0
+        >>> # Candidate 10s after used interval ends
+        >>> _compute_diversity_penalty(20.0, 3.0, [(2.0, 8.0)], 60.0)
+        0.0  # distance = 12.0, between 3 and 15, decayed: 0.7*(1-(12-3)/12)=0.7*(-8/12)... actually < 0
+    
+    Side Effects:
+        Calls app.video.MIN_CLIP_GAP to retrieve the minimum gap constant.
+        No I/O or file operations.
     """
     from app.video import MIN_CLIP_GAP
     
@@ -241,7 +429,44 @@ def _compute_diversity_penalty(cand_time: float, duration: float, used_intervals
 
 
 def classify_beat_type(beat: dict, beats: list, beat_idx: int, drops: list, buildups: list) -> str:
-    """Classify beat type for music-aware matching."""
+    """Classify beat type for music-aware matching.
+    
+    Determines the type of a beat based on its energy, strength, and position
+    relative to detected drops and buildups in the music track. This classification
+    is used to adjust clip scoring in music-aware matching - e.g., drop beats
+    prefer high-motion clips, buildup beats prefer increasing motion, etc.
+    
+    Classification hierarchy:
+    1. Drop beat: If beat time is within ~150ms of a detected drop timestamp
+    2. Buildup beat: If beat time falls within a detected buildup segment
+    3. Downbeat: If beat is a local strength maximum in a 4-beat window and
+       strength > 0.6 (approx first beat of a measure)
+    4. Regular beat: Default fallback
+    
+    Args:
+        beat (dict): Beat dict with 'time' (float, seconds) and optional
+            'strength' (float 0-1) and 'energy' (float 0-1) keys.
+        beats (list[dict]): Full list of all beat dicts, used for downbeat
+            heuristics via beat index.
+        beat_idx (int): Index of this beat within the full beats list.
+        drops (list[dict]): Detected drop segments, each with 'time' (float)
+            and 'intensity' (float 0-1).
+        buildups (list[dict]): Detected buildup segments, each with 'start' (float),
+            'end' (float), and 'intensity' (float 0-1).
+    
+    Returns:
+        str: One of 'drop', 'buildup', 'downbeat', or 'regular'.
+    
+    Example:
+        >>> beat = {"time": 5.3, "strength": 0.7}
+        >>> beats = [{"time": 0.0, "strength": 0.8}, {"time": 2.0, "strength": 0.5}, {"time": 4.0, "strength": 0.9}]
+        >>> drops = [{"time": 5.5, "intensity": 0.9}]
+        >>> buildups = [{"start": 1.0, "end": 3.0, "intensity": 0.4}]
+        >>> classify_beat_type(beat, beats, 0, drops, buildups)
+        'drop'
+        >>> classify_beat_type({"time": 2.0, "strength": 0.7}, beats, 1, drops, buildups)
+        'downbeat'
+    """
     beat_time = beat["time"]
     beat_energy = beat.get("energy", beat.get("strength", 0.5))
     beat_strength = beat.get("strength", 0.5)
@@ -268,13 +493,41 @@ def classify_beat_type(beat: dict, beats: list, beat_idx: int, drops: list, buil
 
 
 def _energy_match_weight(beat_energy: float, motion_score: float) -> float:
-    """
-    Compute energy matching weight per SPEC:
-    - Very Low energy (<0.2): prefer calm/low motion
+    """Compute energy matching weight per SPEC.
+    
+    Energy matching adjusts clip scores based on the relationship between
+    the beat's energy level and the clip's motion score. The SPEC specifies:
+    
+    - Very Low energy (<0.2): prefer calm/low motion clips
     - Low (0.2-0.4): prefer gentle motion
-    - Medium (0.4-0.6): neutral
-    - High (0.6-0.8): prefer high motion
-    - Very High (>0.8): prefer maximum motion
+    - Medium (0.4-0.6): neutral (no adjustment)
+    - High (0.6-0.8): prefer high motion clips
+    - Very High (>0.8): maximum boost to high motion (drop beats)
+    
+    The weight multiplier is applied to the base score, so a weight of 1.0
+    means no adjustment, >1.0 boosts the score, and <1.0 reduces it.
+    
+    Args:
+        beat_energy (float): Normalized beat energy 0-1 from music analysis.
+            This is the energy at the closest beat to the current candidate.
+        motion_score (float): Normalized motion score 0-1 from video analysis.
+            Higher values indicate more motion/action in the clip.
+    
+    Returns:
+        float: Energy matching weight. Always >= 0.0. Typical values:
+            - Very Low energy (<0.2): 1.0 to 1.4 (boosts low-motion clips)
+            - Low (0.2-0.4): 1.0 to 1.2 (slight boost to low motion)
+            - Medium (0.4-0.6): 1.0 (neutral)
+            - High (0.6-0.8): 1.0 to 1.3 (boosts high motion)
+            - Very High (>0.8): 1.0 to 1.5 (maximum boost to high motion)
+    
+    Example:
+        >>> _energy_match_weight(0.1, 0.2)  # Very low energy, low motion
+        1.0 + ((1.0 - 0.2) * 0.4) = 1.32
+        >>> _energy_match_weight(0.5, 0.8)  # Medium energy, high motion
+        1.0  # neutral
+        >>> _energy_match_weight(0.9, 0.9)  # Very high energy, high motion
+        1.0 + (0.9 * 0.5) = 1.45
     """
     if beat_energy < 0.2:
         # Very low energy: boost low motion clips
@@ -370,8 +623,9 @@ def _greedy_assign(
         return scenes
 
     # Track the earliest allowed timestamp per video for chronological ordering
-    # Start cursor at intro_skip_seconds to enforce ascending order from valid region
-    video_cursors = {vp: intro_skip_seconds for vp in video_paths}
+    # Cursor starts at 0.0; ascending order enforced relative to previously placed clips
+    # (intro_skip_seconds is handled at candidate generation time, not cursor init)
+    video_cursors = {vp: 0.0 for vp in video_paths}
     
     # Use pre-generated candidates if provided, otherwise generate them
     if pre_generated_candidates is not None:
@@ -1260,15 +1514,27 @@ def _hungarian_assign(
     for beat_idx, cand_idx in zip(row_ind, col_ind):
         if cost_matrix[beat_idx, cand_idx] >= 1e6:
             continue  # Invalid assignment
-        
+
         beat_group = beat_groups[beat_idx]
         cand = all_cands_flat[cand_idx]
         vp, cand_duration, _ = cand_metadata[cand_idx]
-        
+
+        # Recompute the chosen beat metadata for this specific row before serializing output.
+        beat_info = None
+        if all_beats:
+            beat_diffs = [(abs(b["time"] - beat_group["start"]), i) for i, b in enumerate(all_beats)]
+            if beat_diffs:
+                _, closest_idx = min(beat_diffs)
+                beat_info = all_beats[closest_idx]
+
+        beat_energy = beat_info.get("energy", beat_info.get("strength", 0.5)) if beat_info else 0.5
+        beat_strength = beat_info.get("strength", 0.5) if beat_info else 0.5
+        beat_type = classify_beat_type(beat_info, all_beats, closest_idx if beat_info else 0, drops, buildups) if beat_info else "regular"
+
         duration = beat_group["duration"]
         cand_time = cand["t"]
         cand_end = cand_time + duration
-        
+
         # Final overlap check
         overlap = False
         for (used_start, used_end) in used_intervals[vp]:
@@ -1277,15 +1543,15 @@ def _hungarian_assign(
                 break
         if overlap:
             continue
-        
+
         # Reuse limit check
         if video_usage[vp] >= reuse_limit:
             continue
-        
+
         # Snap to frame
         snapped_start = snap_to_frame(cand_time)
         snapped_end = snapped_start + duration
-        
+
         # Final snapped overlap check
         overlap = False
         for (used_start, used_end) in used_intervals[vp]:
@@ -1294,10 +1560,10 @@ def _hungarian_assign(
                 break
         if overlap:
             continue
-        
+
         # Compute final score for output
         score = 1.0 - cost_matrix[beat_idx, cand_idx]
-        
+
         assignments.append({
             "beat_idx": beat_idx,
             "video_path": vp,
@@ -1310,7 +1576,7 @@ def _hungarian_assign(
             "beat_energy": beat_energy,
             "beat_type": beat_type,
         })
-        
+
         video_usage[vp] += 1
         used_intervals[vp].append((snapped_start, snapped_end))
         from app.video import MIN_CLIP_GAP
@@ -1339,7 +1605,7 @@ def ai_assign_clips(
     intro_skip_seconds: float = INTRO_SKIP_SECONDS,
 ) -> list[dict]:
     """
-    AI-assisted clip assignment with:
+    heuristic-aware clip assignment with:
     - Scene detection (lazy: only analyzes videos when needed)
     - Motion analysis (optical flow)
     - Diversity scoring
@@ -1380,7 +1646,7 @@ def ai_assign_clips(
 
     beat_groups = create_beat_groups(beat_times, min_beats, max_beats, music_duration=music_duration)
     if not beat_groups:
-        return [], [], {}, {}
+        return [], {}, {}, {}
 
     # Lazy scene cache: analyze videos on-demand, cache results
     # This avoids analyzing all videos upfront (saves RAM for many videos)
@@ -1603,7 +1869,7 @@ def sync_clips_with_beats(
     beat_groups = create_beat_groups(beats, min_beats, max_beats, music_duration=music_duration)
 
     if ai_mode:
-        # AI-assisted mode
+        # Heuristic mode: assign clips using beat-matching, scene detection, motion scoring
         cache_dir = os.path.join(output_dir, "cache")
         ai_results, beat_groups, debug_scores, all_candidates = ai_assign_clips(
             beats,

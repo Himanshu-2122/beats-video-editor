@@ -830,7 +830,32 @@ def check_qsv():
             errors="replace",
         )
         output = process.stdout + process.stderr
-        return "h264_qsv" in output
+        if "h264_qsv" not in output:
+            return False
+
+        probe = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=1280x720:rate=30",
+                "-frames:v",
+                "1",
+                "-c:v",
+                "h264_qsv",
+                "-f",
+                "null",
+                "-",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        return probe.returncode == 0
     except Exception:
         return False
 
@@ -1130,67 +1155,6 @@ def process_clip(video_path, duration, output_path, start_time=None, snap_frame:
         raise RuntimeError(f"Normalization failed: output {out_info.get('width')}x{out_info.get('height')}, expected {tw}x{th}")
 
     return output_path
-
-    qsv_command = [
-        "ffmpeg",
-        "-y",
-        "-ss",
-        f"{start_time:.3f}",
-        "-i",
-        video_path,
-        "-t",
-        f"{duration:.3f}",
-        "-vf",
-        video_filter,
-        "-an",
-    ]
-    qsv_command.extend(get_qsv_video_args())
-    qsv_command.extend([
-        "-movflags",
-        "+faststart",
-        output_path,
-    ])
-
-    try:
-        run_ffmpeg(qsv_command)
-    except RuntimeError:
-        if os.path.exists(output_path):
-            try:
-                os.remove(output_path)
-            except OSError:
-                pass
-        cpu_command = [
-            "ffmpeg",
-            "-y",
-            "-ss",
-            f"{start_time:.3f}",
-            "-i",
-            video_path,
-            "-t",
-            f"{duration:.3f}",
-            "-vf",
-            video_filter,
-            "-an",
-        ]
-        cpu_command.extend(get_cpu_video_args())
-        cpu_command.extend([
-            "-movflags",
-            "+faststart",
-            output_path,
-        ])
-        run_ffmpeg(cpu_command)
-
-    if not os.path.exists(output_path):
-        raise RuntimeError(f"Clip was not created: {output_path}")
-
-    # Verify output
-    out_dur = get_video_duration(output_path)
-    if abs(out_dur - duration) > 0.1:
-        raise RuntimeError(f"Duration mismatch: expected {duration:.3f}s, got {out_dur:.3f}s")
-
-    out_info = get_video_info(output_path)
-    if out_info.get('width') != tw or out_info.get('height') != th:
-        raise RuntimeError(f"Normalization failed: output {out_info.get('width')}x{out_info.get('height')}, expected {tw}x{th}")
 
     return output_path
 
@@ -2100,9 +2064,9 @@ def render_video_single_pass(
     for src in unique_sources:
         command.extend(["-i", src])
     
-    # Add music as last input
+    # Add music as last input, loop audio to cover full video duration
     music_input_idx = len(unique_sources)
-    command.extend(["-i", music_path])
+    command.extend(["-stream_loop", "-1", "-i", music_path])
     
     filters = []
     
