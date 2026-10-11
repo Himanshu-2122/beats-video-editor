@@ -10,6 +10,8 @@ import numpy as np
 from typing import Optional
 from functools import lru_cache
 
+from app.logging_system import get_logger
+
 # ============================================================
 # VIDEO SETTINGS
 # ============================================================
@@ -682,7 +684,8 @@ def run_ffmpeg(command):
     Run FFmpeg.
     """
 
-    print("\nRunning FFmpeg...")
+    logger = get_logger()
+    logger.app_info("Running FFmpeg command")
 
     process = subprocess.run(
         command,
@@ -694,8 +697,17 @@ def run_ffmpeg(command):
     )
 
     if process.returncode != 0:
-        print("\nFFmpeg ERROR:")
-        print(process.stderr)
+        logger.app_error("FFmpeg command failed")
+        # Extract key error info from FFmpeg stderr
+        stderr_lines = process.stderr.strip().split('\n')
+        error_summary = []
+        for line in stderr_lines:
+            if any(kw in line.lower() for kw in ['error', 'failed', 'invalid', '-9', '-22']):
+                error_summary.append(line.strip())
+        if error_summary:
+            logger.app_error("FFmpeg errors: " + " | ".join(error_summary[:5]))
+        else:
+            logger.app_error("FFmpeg stderr: " + process.stderr[:200])
         raise RuntimeError("FFmpeg command failed.")
 
     return process
@@ -1078,11 +1090,11 @@ def process_clip(video_path, duration, output_path, start_time=None, snap_frame:
     if snap_frame:
         start_time = snap_to_frame(start_time)
 
-    print(f"[diagnostic] process_clip: start={start_time:.3f}s duration={duration:.3f}s source_duration={source_duration:.3f}s")
+    logger.app_info(f"process_clip: start={start_time:.3f}s duration={duration:.3f}s source_duration={source_duration:.3f}s")
     if needs_normalize:
-        print(f"[normalize] {os.path.basename(video_path)}: {src_width}x{src_height}@{src_fps:.2f}fps -> {tw}x{th}@{FPS}fps")
+        logger.app_info(f"normalize: {os.path.basename(video_path)}: {src_width}x{src_height}@{src_fps:.2f}fps -> {tw}x{th}@{FPS}fps")
     else:
-        print(f"[fast-encode] {os.path.basename(video_path)}: already {tw}x{th}@{FPS}fps, using minimal filter (fps+setsar) with QSV")
+        logger.app_info(f"fast-encode: {os.path.basename(video_path)}: already {tw}x{th}@{FPS}fps, minimal filter")
 
     # Choose filter based on whether normalization is needed
     if needs_normalize:
@@ -1092,6 +1104,16 @@ def process_clip(video_path, duration, output_path, start_time=None, snap_frame:
         # Minimal filter for already-matching clips: just fps+setsar (fast with QSV)
         # But still apply color grading for consistency
         video_filter = get_clip_trim_filter() + "," + get_color_normalization_filter() + ",unsharp=3:3:0.25:3:3:0.15"
+
+    # Choose encoder based on QSV availability
+    use_qsv = check_qsv()
+
+    if use_qsv:
+        video_args = get_qsv_video_args()
+        video_encoder = "h264_qsv"
+    else:
+        video_args = get_cpu_video_args()
+        video_encoder = "libx264"
 
     qsv_command = [
         "ffmpeg",
@@ -1106,7 +1128,7 @@ def process_clip(video_path, duration, output_path, start_time=None, snap_frame:
         video_filter,
         "-an",
     ]
-    qsv_command.extend(get_qsv_video_args())
+    qsv_command.extend(video_args)
     qsv_command.extend([
         "-movflags",
         "+faststart",

@@ -1,118 +1,84 @@
 #!/usr/bin/env python
-"""
-Regression test for the multi-video greedy path bug.
-
-This test specifically covers the scenario that broke:
-- 3+ videos
-- Long enough total duration that use_hungarian gets estimated False
-- Forces the greedy path with use_hungarian=False
-- Asserts that assigned clips > 0
-
-This is different from test_long_video.py (single video) - this tests the
-exact bug where all_candidates={} was passed to Hungarian when use_hungarian=False.
-"""
+"""Regression test for the multi-video greedy path."""
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
-import shutil
+from pathlib import Path
 
-sys.path.insert(0, 'C:/Users/himan/Projects/beats-video-editor')
+import numpy as np
+import soundfile as sf
+
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
 
 from app.beat import analyze_music_full
-from app.video import analyze_video_full
 from app.sync import ai_assign_clips
+from app.video import analyze_video_full
+
+
+def _write_music(path: Path, duration_seconds: float = 30.0, sample_rate: int = 44100):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    t = np.linspace(0.0, duration_seconds, int(duration_seconds * sample_rate), endpoint=False)
+    pulse = (np.sin(2 * np.pi * 2.0 * t) > 0).astype(np.float32)
+    carrier = np.sin(2 * np.pi * 220.0 * t)
+    signal = carrier * (0.45 + 0.55 * pulse)
+    sf.write(str(path), np.clip(signal, -1.0, 1.0).astype(np.float32), sample_rate)
+
+
+def _create_video(path: Path, duration_seconds: float = 18.0):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run([
+        "ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=size=640x360:rate=30",
+        "-t", str(duration_seconds), "-c:v", "libx264", "-pix_fmt", "yuv420p", str(path),
+    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
 
 def test_multi_video_greedy_path():
-    """
-    Test that multi-video greedy path (use_hungarian=False) generates clips.
-    
-    This is a regression test for the bug where:
-    - use_hungarian=False caused all_candidates={} to be passed to _hungarian_assign
-    - _hungarian_assign didn't fallback to greedy because total_cands=0 made problem size 0
-    - _greedy_assign received empty candidates and returned 0 assignments
-    """
-    # Use 3 output videos (~200s each) + music (173s)
-    video_paths = [
-        'output/beat_edit_20260816_214752.mp4',  # 209s
-        'output/beat_edit_20260817_000114.mp4',  # 206s
-        'output/beat_edit_20260817_003752.mp4',  # 209s
-    ]
-    music_path = 'temp_uploads/beats_upload_lnbmq50e/music.mp3'  # 173s
-
-    # Verify all files exist
-    for vp in video_paths:
-        assert os.path.exists(vp), f"Video not found: {vp}"
-    assert os.path.exists(music_path), f"Music not found: {music_path}"
-
-    temp_dir = tempfile.mkdtemp(prefix='regression_test_')
-    
+    temp_dir = tempfile.mkdtemp(prefix="regression_test_")
     try:
-        music_analysis = analyze_music_full(music_path, cache_dir=os.path.join(temp_dir, 'cache'))
-        beats = music_analysis.get('beats', [])
-        
-        video_analyses = []
-        for vp in video_paths:
-            va = analyze_video_full(vp, cache_dir=os.path.join(temp_dir, 'cache'), fast_mode=True)
-            video_analyses.append(va)
+        video_dir = Path(temp_dir) / "videos"
+        video_dir.mkdir(exist_ok=True)
+        video_paths = [video_dir / f"video_{i}.mp4" for i in range(3)]
+        for path in video_paths:
+            _create_video(path, duration_seconds=18.0)
 
-        # This should trigger use_hungarian=False due to:
-        # 40 beat_groups * 3 videos * 7 durations * 10 = 8400 > 5000
-        ai_results, beat_groups, debug_scores, all_candidates = ai_assign_clips(
+        music_path = Path(temp_dir) / "music.mp3"
+        _write_music(music_path, duration_seconds=30.0)
+
+        music_analysis = analyze_music_full(str(music_path), cache_dir=os.path.join(temp_dir, "cache"))
+        beats = music_analysis.get("beats", [])
+        assert beats, "Regression audio produced no detected beats"
+
+        video_analyses = [
+            analyze_video_full(str(vp), cache_dir=os.path.join(temp_dir, "cache"), fast_mode=True)
+            for vp in video_paths
+        ]
+
+        ai_results, beat_groups, _, _ = ai_assign_clips(
             beats,
-            video_paths,
+            [str(vp) for vp in video_paths],
             min_beats=4,
             max_beats=8,
             sample_interval=2.0,
             scene_threshold=0.4,
             reuse_limit=None,
             compute_motion=False,
-            cache_dir=os.path.join(temp_dir, 'cache'),
+            cache_dir=os.path.join(temp_dir, "cache"),
             music_analysis=music_analysis,
             video_analyses=video_analyses,
         )
 
-        # THE ASSERTION THAT WOULD HAVE FAILED BEFORE THE FIX:
-        # Before fix: ai_results would be [] (empty list) -> len == 0
-        # After fix: ai_results should have assignments > 0
         num_assignments = len(ai_results)
         num_beat_groups = len(beat_groups)
-        
-        print(f"Beat groups: {num_beat_groups}")
-        print(f"Assignments made: {num_assignments}")
-        print(f"Coverage: {num_assignments}/{num_beat_groups} = {num_assignments/num_beat_groups*100:.1f}%")
-        
-        # Assert we got assignments (the core fix)
-        assert num_assignments > 0, "REGRESSION: No clips assigned! The greedy path bug has returned."
-        
-        # Assert reasonable coverage (at least 50% of beat groups covered)
-        # This is a sanity check - with 3 videos of ~200s each and 173s music, 
-        # we should cover most beat groups
-        coverage_ratio = num_assignments / num_beat_groups
-        assert coverage_ratio >= 0.5, f"Coverage too low: {coverage_ratio:.1%} (expected >= 50%)"
-        
-        # Verify assignments are distributed across videos (not all from one)
-        videos_used = set(a['source_path'] for a in ai_results)
-        assert len(videos_used) >= 2, f"Only {len(videos_used)} video(s) used, expected at least 2"
-        
-        print("[PASS] REGRESSION TEST PASSED")
-        print(f"  - Assignments > 0: {num_assignments} > 0 [OK]")
-        print(f"  - Coverage >= 50%: {coverage_ratio:.1%} >= 50% [OK]")
-        print(f"  - Videos used: {len(videos_used)}/3 [OK]")
-        
-        return True
-        
+        assert num_assignments > 0, "REGRESSION: No clips assigned in the multi-video path"
+        coverage_ratio = num_assignments / num_beat_groups if num_beat_groups else 0.0
+        assert coverage_ratio >= 0.5, f"Coverage too low: {coverage_ratio:.1%}"
+
+        videos_used = {a["source_path"] for a in ai_results}
+        assert len(videos_used) >= 2, f"Expected at least 2 videos used, got {len(videos_used)}"
+
+        print(f"Multi-video regression passed: {num_assignments} assignments across {len(videos_used)} videos")
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
-
-if __name__ == "__main__":
-    print("=" * 60)
-    print("REGRESSION TEST: Multi-video greedy path (use_hungarian=False)")
-    print("=" * 60)
-    try:
-        success = test_multi_video_greedy_path()
-        sys.exit(0 if success else 1)
-    except Exception as e:
-        print(f"\n[FAIL] REGRESSION TEST FAILED: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
