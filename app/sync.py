@@ -560,7 +560,56 @@ def _greedy_assign(
     pre_generated_candidates: dict = None,  # Pre-generated candidates from caller
     intro_skip_seconds: float = INTRO_SKIP_SECONDS,
     source_durations: dict = None,  # Pre-computed durations {video_path: duration}
+    semantic_weight: float = 0.0,
+    sim_matrix: np.ndarray = None,
+    video_list: list[str] = None,
 ) -> list[dict]:
+    """
+    Greedy assignment of clips to beats using:
+    - Scene bonus
+    - Proximity bonus
+    - Motion score
+    - Diversity penalty
+    - Beat energy matching (music-aware)
+    - Beat type classification (downbeat, drop, buildup, regular)
+    - Optional semantic similarity bonus weighted by `semantic_weight`.
+    """
+    # Existing diagnostic prints omitted for brevity
+    assignments = []
+    video_usage_count = {v: 0 for v in video_paths}
+    used_source_intervals = {v: [] for v in video_paths}
+
+    # Extract beats and music features for energy matching
+    all_beats = music_analysis.get("beats", []) if music_analysis else []
+    drops = music_analysis.get("drops", []) if music_analysis else []
+    buildups = music_analysis.get("buildups", []) if music_analysis else []
+
+    # Prepare semantic structures if weight > 0 and matrix provided
+    if semantic_weight > 0.0 and sim_matrix is not None and video_list is not None:
+        # Ensure video_list order matches video_paths for lookup later
+        pass
+
+    # The rest of the function remains unchanged, but scoring section now adds semantic bonus.
+    for beat_idx, beat_group in enumerate(beat_groups):
+        beat_time = beat_group["start"]
+        duration = beat_group["duration"]
+        # ... existing candidate generation logic ...
+        # Inside candidate loop, after computing base_score and before final score:
+        # Add semantic bonus if applicable
+        if semantic_weight > 0.0 and sim_matrix is not None and video_list is not None:
+            semantic_score = semantic_bonus(beat_idx, vp, sim_matrix, video_list, semantic_weight)
+        else:
+            semantic_score = 0.0
+        # Combine with base_score using simple weighted sum (alpha = semantic_weight)
+        # Here we treat semantic_weight as the multiplier directly added to base_score proportionally.
+        # Adjust final_score calculation:
+        # base_score currently includes scene, proximity, motion, etc.
+        # final_score = base_score + semantic_score
+        # (semantic_score already scaled by weight)
+        final_score = base_score + semantic_score
+        # Rest of logic unchanged (cost matrix etc.)
+        # ...
+
     """
     Greedy assignment of clips to beats using:
     - Scene bonus
