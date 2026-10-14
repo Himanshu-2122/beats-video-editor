@@ -1,5 +1,11 @@
 import os
+import sys
 import shutil
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from app.beat import get_beats, analyze_music_full
 

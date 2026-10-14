@@ -1,4 +1,4 @@
-﻿"""
+"""
 Beat grouping, candidate scoring, and clip assignment module.
 
 Responsibility:
@@ -44,6 +44,7 @@ from app.video import (
     generate_candidates,
     snap_to_frame,
     analyze_motion_at_candidates,
+    probe_audio_duration,
     SCENE_THRESH,
     SAMPLE_INTERVAL,
     MAX_CANDIDATES_PER_SOURCE,
@@ -1756,6 +1757,22 @@ def ai_assign_clips(
             reuse_limit,
             intro_skip_seconds=intro_skip_seconds,
         )
+        if len(assignments) < len(beat_groups) * 0.8:
+            print(f"       Hungarian achieved low coverage ({len(assignments)}/{len(beat_groups)}), falling back to greedy assignment")
+            assignments, debug_scores, all_candidates = _greedy_assign(
+                beat_groups,
+                video_paths,
+                scene_threshold=scene_threshold,
+                sample_interval=sample_interval,
+                reuse_limit=reuse_limit,
+                compute_motion=compute_motion,
+                cache_dir=cache_dir,
+                music_analysis=music_analysis,
+                video_analyses=video_analyses,
+                pre_generated_candidates=all_candidates,
+                intro_skip_seconds=intro_skip_seconds,
+                source_durations=source_durations,
+            )
     else:
         # Large problem: use greedy directly with pre_generated_candidates=None
         # so it generates its own candidates internally
@@ -1783,6 +1800,7 @@ def ai_assign_clips(
             "music_start": beat_groups[a["beat_idx"]]["start"],
             "music_end": beat_groups[a["beat_idx"]]["end"],
             "clip_duration": a["duration"],
+            "duration": a["duration"],
             "source_start": a["source_start"],
             "score": a["score"],
             "scene_flag": a["scene_flag"],

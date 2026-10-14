@@ -1,4 +1,4 @@
-﻿import os
+import os
 import random
 import re
 import subprocess
@@ -11,6 +11,8 @@ from typing import Optional
 from functools import lru_cache
 
 from app.logging_system import get_logger
+
+logger = get_logger()
 
 # ============================================================
 # VIDEO SETTINGS
@@ -1034,7 +1036,7 @@ def get_cpu_video_args():
         "-color_range",
         "tv",
         "-x264-params",
-        "colormatrix=bt709:colorprim=bt709:transfer=bt709:range=tv:deblock=0,0:psy-rd=1.0,0.15",
+        "colormatrix=bt709:colorprim=bt709:transfer=bt709:deblock=0,0:psy-rd=1.0,0.15",
     ]
 
 
@@ -1324,19 +1326,35 @@ def create_transition_video(group_paths, output_path, logger=None, progress_call
 
     # Use hardware encoder if available
     use_qsv = check_qsv()
-    if use_qsv:
-        command.extend(get_qsv_video_args())
-    else:
-        command.extend(get_cpu_video_args())
-
-    command.extend([
+    encoder_args = get_qsv_video_args() if use_qsv else get_cpu_video_args()
+    command_full = list(command) + encoder_args + [
         "-movflags",
         "+faststart",
         output_path,
-    ])
+    ]
 
     total_output_duration = cumulative_duration
-    run_ffmpeg_stream(command, logger=logger, progress_callback=progress_callback, total_duration=total_output_duration)
+    try:
+        run_ffmpeg_stream(command_full, logger=logger, progress_callback=progress_callback, total_duration=total_output_duration)
+    except RuntimeError:
+        if use_qsv:
+            if logger:
+                logger("QSV transition render failed, falling back to CPU encoder...")
+            else:
+                print("QSV transition render failed, falling back to CPU encoder...")
+            if os.path.exists(output_path):
+                try:
+                    os.remove(output_path)
+                except OSError:
+                    pass
+            cpu_command = list(command) + get_cpu_video_args() + [
+                "-movflags",
+                "+faststart",
+                output_path,
+            ]
+            run_ffmpeg_stream(cpu_command, logger=logger, progress_callback=progress_callback, total_duration=total_output_duration)
+        else:
+            raise
 
     if not os.path.exists(output_path):
         raise RuntimeError("Transition video was not created.")
@@ -2100,7 +2118,7 @@ def render_video_single_pass(
         src = a["source_path"]
         input_idx = source_to_input_idx[src]
         start_time = a["source_start"]
-        duration = a["duration"]
+        duration = float(a.get("clip_duration", a.get("duration", 0.0)))
         
         # Trim and normalize in one filter chain per clip
         # trim -> setpts -> scale/pad -> fps -> color_norm -> unsharp
@@ -2120,6 +2138,7 @@ def render_video_single_pass(
     if use_transitions and len(assignment_labels) > 1:
         print("\nAdding selective transitions (single-pass)...")
         previous_label = assignment_labels[0][0]
+        cumulative_duration = assignment_labels[0][1]
         
         for i in range(1, len(assignment_labels)):
             current_label, current_duration = assignment_labels[i]
@@ -2128,7 +2147,7 @@ def render_video_single_pass(
             transition = random.choice(TRANSITIONS)
             trans_dur = min(transition_duration, prev_duration / 2, current_duration / 2)
             trans_dur = max(0.10, trans_dur)
-            offset = sum(assignment_labels[j][1] for j in range(i)) - trans_dur
+            offset = cumulative_duration - trans_dur
             output_label = f"[v{i}]"
             
             filters.append(
@@ -2140,6 +2159,7 @@ def render_video_single_pass(
             else:
                 print(f"       Transition {i}: {transition} {trans_dur:.2f}s")
             
+            cumulative_duration = cumulative_duration + current_duration - trans_dur
             previous_label = output_label
         
         final_video_label = previous_label
@@ -2157,9 +2177,12 @@ def render_video_single_pass(
     # Audio: just take the music input
     filter_complex = ";".join(filters)
     
-    command.extend([
-        "-filter_complex",
-        filter_complex,
+    base_command = ["ffmpeg", "-y"]
+    for src in unique_sources:
+        base_command.extend(["-i", src])
+    base_command.extend([
+        "-stream_loop", "-1", "-i", music_path,
+        "-filter_complex", filter_complex,
         "-map", "[outv]",
         "-map", f"{music_input_idx}:a",
         "-c:a", "aac",
@@ -2167,22 +2190,32 @@ def render_video_single_pass(
         "-profile:a", "aac_low",
         "-shortest",
     ])
-    
+    suffix_args = ["-movflags", "+faststart", output_path]
+
     # Use hardware encoder if available
     use_qsv = check_qsv()
-    if use_qsv:
-        command.extend(get_qsv_video_args())
-    else:
-        command.extend(get_cpu_video_args())
-    
-    command.extend([
-        "-movflags", "+faststart",
-        output_path,
-    ])
+    encoder_args = get_qsv_video_args() if use_qsv else get_cpu_video_args()
+    command = list(base_command) + encoder_args + suffix_args
     
     # Run with streaming for progress
-    total_duration = sum(a["duration"] for a in assignments)
-    run_ffmpeg_stream(command, logger=logger, progress_callback=progress_callback, total_duration=total_duration)
+    total_duration = sum(float(a.get("clip_duration", a.get("duration", 0.0))) for a in assignments)
+    try:
+        run_ffmpeg_stream(command, logger=logger, progress_callback=progress_callback, total_duration=total_duration)
+    except RuntimeError:
+        if use_qsv:
+            if logger:
+                logger("QSV single-pass render failed, falling back to CPU encoder...")
+            else:
+                print("QSV single-pass render failed, falling back to CPU encoder...")
+            if os.path.exists(output_path):
+                try:
+                    os.remove(output_path)
+                except OSError:
+                    pass
+            cpu_command = list(base_command) + get_cpu_video_args() + suffix_args
+            run_ffmpeg_stream(cpu_command, logger=logger, progress_callback=progress_callback, total_duration=total_duration)
+        else:
+            raise
     
     if not os.path.exists(output_path):
         raise RuntimeError("Single-pass render failed.")
